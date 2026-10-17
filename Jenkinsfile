@@ -14,12 +14,47 @@
 //   - 通过 Jenkins 参数或环境变量切换域名，无需修改仓库配置
 //
 // 阶段顺序（失败即停）：
-//   检出代码 -> 准备环境 -> 数据与配置自检 -> 框架单元测试 -> 冒烟/全量 -> 归档报告
-//   「框架单元测试」离线运行（约 3 秒），用于确认框架自身没被改坏；
-//   若它失败，后续接口测试结果没有参考价值，因此放在接口测试之前执行。
+//   检出代码 -> 准备环境 -> 静态检查 -> 环境预检 -> 数据与配置自检
+//   -> 框架单元测试（含覆盖率门槛） -> 冒烟/全量 -> 归档报告
+//
+// 各道门的用意（越靠前越便宜，越早失败越省钱）：
+//   静态检查     秒级，拦语法 / 未使用导入 / 明显笔误
+//   环境预检     十几秒，拦「依赖缺失、配置非法、档案不存在、域名不可达」
+//                —— 否则这些问题会表现为几十条用例失败，排查成本完全不同
+//   单元测试     离线，确认框架自身没被改坏 + 覆盖率不低于门槛
+//   冒烟/全量    真正打接口；若前四道门都没红，这里的失败才真的是业务问题
 //
 // 报告查看：构建完成后，构建页左侧「Allure Report」即可查看
 // ============================================================================
+
+// ---------------------------------------------------------------------------
+// 辅助函数：按「插件是否已安装」决定是否追加参数
+// ---------------------------------------------------------------------------
+// 为什么要在运行时探测而不是直接写死参数：
+//     并行（xdist）与重试（rerunfailures）属于增强能力，节点上未必安装。
+//     写死会让「没装插件的节点」直接构建失败，而失败原因与测试质量无关。
+//     探测后降级，既保住流水线可用性，又不会静默假装用过（会打印跳过原因）。
+String pluginArgs(boolean needRetries, String retries, boolean needParallel, String parallel) {
+    def args = []
+    if (needRetries) {
+        def hasRerun = sh(script: 'python -c "import pytest_rerunfailures"',
+                          returnStatus: true) == 0
+        if (hasRerun) {
+            args << "--reruns=${retries} --reruns-delay=2"
+        } else {
+            echo "[跳过] 未安装 pytest-rerunfailures，本次不启用失败重试"
+        }
+    }
+    if (needParallel) {
+        def hasXdist = sh(script: 'python -c "import xdist"', returnStatus: true) == 0
+        if (hasXdist) {
+            args << "-n ${parallel}"
+        } else {
+            echo "[跳过] 未安装 pytest-xdist，本次不启用并行执行"
+        }
+    }
+    return args.join(' ')
+}
 
 pipeline {
     agent any
@@ -44,6 +79,12 @@ pipeline {
                             'default=内置默认，行为与原始版本一致；' +
                             '可选 gov / finance_erp / mall / dataplatform，' +
                             '或自行新增档案。切换被测系统只需改这里，用例数据无需改动')
+        string(name: 'COVERAGE_MIN', defaultValue: '80',
+               description: '框架自测覆盖率下限（%）。低于该值构建失败，用于防止「改了框架但没补单测」')
+        string(name: 'RETRIES', defaultValue: '0',
+               description: '失败用例重试次数（需 pytest-rerunfailures）。建议 1：网络抖动不至于让整轮红掉')
+        string(name: 'PARALLEL', defaultValue: '1',
+               description: '并行进程数（需 pytest-xdist）。1 = 串行执行')
     }
 
     options {
@@ -91,7 +132,37 @@ pipeline {
                     echo "执行模式=${params.RUN_MODE} 目标环境=${params.TARGET_ENV} " +
                          "系统档案=${params.SYSTEM} 结果回写=${env.AMSAPI_WRITE_BACK} 域名=${domain}"
                 }
-                sh 'pip install -r requirements.txt'
+                sh '''
+                    set -e
+                    pip install --disable-pip-version-check -r requirements.txt
+                    pip install --disable-pip-version-check -r requirements-dev.txt \
+                      || echo "[警告] 开发依赖安装失败：静态检查 / 覆盖率 / 并行 / 重试将自动降级，继续执行"
+                '''
+            }
+        }
+
+        stage('静态检查') {
+            steps {
+                script {
+                    // 秒级反馈的门：只拦语法级 / 明显笔误级问题，不做风格洁癖
+                    def hasFlake8 = sh(script: 'python -c "import flake8"',
+                                       returnStatus: true) == 0
+                    if (hasFlake8) {
+                        sh 'python -m flake8 .'
+                    } else {
+                        echo "[跳过] 未安装 flake8（pip install -r requirements-dev.txt）"
+                    }
+                }
+            }
+        }
+
+        stage('环境预检') {
+            steps {
+                // 把「依赖缺失 / 配置非法 / 档案不存在 / 用例数据不可读 / 域名不可达」
+                // 在跑用例之前一次性确认掉，避免环境问题被误解成一堆业务用例失败。
+                // 阻断性问题（错误）返回非 0；警告（如可选依赖未装）只提示不阻断。
+                // 若希望「有警告也失败」，把下面改成 python tools/preflight.py --strict
+                sh 'python tools/preflight.py'
             }
         }
 
@@ -104,35 +175,66 @@ pipeline {
 
         stage('框架单元测试') {
             steps {
-                // 离线自检：验证框架自身代码（参数化 / 关联 / Excel 读写 / 断言等）未被改坏。
-                // 不依赖被测环境，秒级完成；失败时后续接口测试无意义，故放在最前面执行。
-                sh 'python -m pytest tests -q'
+                script {
+                    // 离线自检：验证框架自身代码（参数化 / 关联 / Excel 读写 / 断言 / 脱敏 …）
+                    // 未被改坏，并守住覆盖率下限 —— 改了框架却不补单测，在这里就被拦住。
+                    // 不依赖被测环境，秒级完成；失败时后续接口测试无意义，故放在最前面执行。
+                    // -o addopts="" 去掉 pytest.ini 里的 -vs，避免 CI 日志被逐条用例刷屏。
+                    def hasCov = sh(script: 'python -c "import pytest_cov"',
+                                    returnStatus: true) == 0
+                    if (hasCov) {
+                        sh "python -m pytest tests -o addopts='' -q " +
+                           "--cov --cov-report=term-missing:skip-covered " +
+                           "--cov-report=xml:report/coverage.xml " +
+                           "--cov-fail-under=${params.COVERAGE_MIN}"
+                    } else {
+                        echo "[降级] 未安装 pytest-cov，本次仅执行单元测试、不校验覆盖率"
+                        sh "python -m pytest tests -o addopts='' -q"
+                    }
+                }
             }
         }
 
         stage('冒烟测试') {
             when { expression { params.RUN_MODE == 'smoke' } }
             steps {
-                sh 'python main.py --smoke --report allure'
+                script {
+                    def extra = pluginArgs(params.RETRIES?.trim() && params.RETRIES != '0',
+                                           params.RETRIES,
+                                           params.PARALLEL?.trim() && params.PARALLEL != '1',
+                                           params.PARALLEL)
+                    sh "python main.py --smoke --report allure ${extra}"
+                }
             }
         }
 
         stage('全量回归') {
             when { expression { params.RUN_MODE == 'full' } }
             steps {
-                sh 'python main.py --report allure'
+                script {
+                    def extra = pluginArgs(params.RETRIES?.trim() && params.RETRIES != '0',
+                                           params.RETRIES,
+                                           params.PARALLEL?.trim() && params.PARALLEL != '1',
+                                           params.PARALLEL)
+                    sh "python main.py --report allure ${extra}"
+                }
             }
         }
     }
 
     post {
         always {
-            // 归档日志与 HTML 报告，便于事后追溯
-            archiveArtifacts artifacts: 'log/*.log, report/report.html',
+            // 归档日志与各类报告，便于事后追溯与复盘。
+            // 日志与 Allure 报告中的口令 / 令牌已由框架脱敏（conf.ini [log] mask_sensitive），
+            // 因此归档制品可以安全地在团队内共享。
+            archiveArtifacts artifacts: 'log/*.log, report/report.html, ' +
+                                        'report/coverage.xml, report/unit-coverage/**',
                              allowEmptyArchive: true,
                              fingerprint: true
 
-            // 用 Allure 插件渲染报告（基于 report/allure-results）
+            // 用 Allure 插件渲染报告（基于 report/allure-results）。
+            // 报告「环境」页会带上构建号 / git 提交 / 分支 / 依赖版本（见 common/metadata.py），
+            // 单独把报告转发出去也能确认它对应哪次构建、哪次提交。
             allure includeProperties: true, jdk: '', results: [[path: 'report/allure-results']]
         }
 

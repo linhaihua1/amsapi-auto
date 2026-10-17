@@ -30,13 +30,18 @@ from common import base
 from common.exceptions import CaseSkipped
 from common.profile import load_profile
 from common.variable import GlobalVar
-from config import settings
 from utils import allureutil
 from utils.logutil import logger
 from utils.requestsutil import RequestSend
 
 # 用例执行状态在变量池里的键前缀（供 depends 判断）
 CASE_STATUS_PREFIX = "__case_status__:"
+
+# 后置清理失败的登记前缀。
+# 用途：teardown 失败不能改变用例结论（否则「清理接口挂了」会被误报成「业务有问题」），
+# 但也绝不能无声吞掉 —— 那意味着脏数据已经在被测系统里躺着了。
+# 这里登记到变量池，由会话收尾统一汇总告警。
+TEARDOWN_FAIL_PREFIX = "__teardown_failed__:"
 
 
 def _has_header(headers, name):
@@ -81,6 +86,9 @@ class BaseApi:
                                   response_format=self.profile.response_format)
         self.res = None            # 最近一次请求的响应，断言与提取都基于它
         self._current_case = None  # 正在执行的用例（供钩子读取上下文）
+        # 最近一条用例的后置清理失败信息（空列表表示清理正常）。
+        # 失败不改变用例结论，但会登记到变量池，由会话收尾汇总告警 —— 脏数据必须可见。
+        self.teardown_errors = []
 
     # ==================================================================
     # 一、URL 组装
@@ -631,6 +639,7 @@ class BaseApi:
         """
         case = case or {}
         self._current_case = case
+        self.teardown_errors = []
 
         # 清掉上一条用例的响应：被 depends 跳过的用例不会发请求，
         # 若沿用旧响应，结果回写会把「上一条的响应 + 失败标记」记到本用例头上，
@@ -662,11 +671,16 @@ class BaseApi:
             self.record_case_status(case, is_pass)
 
             # 后置清理必须执行，即使断言失败 —— 否则造出来的脏数据会污染
-            # 后续用例，以及下一次构建。清理本身的异常只记日志，不掩盖原始失败。
+            # 后续用例，以及下一次构建。清理本身的异常只记日志，不掩盖原始失败；
+            # 但会登记下来供会话收尾汇总（静默吞掉 = 脏数据无人知，这是更危险的失败）。
             try:
                 self.run_steps(case.get("teardown"), label="后置清理")
             except Exception as exc:                       # noqa: BLE001
-                logger.error("后置清理步骤执行失败（不影响用例结论）：{}".format(exc))
+                self.teardown_errors.append(str(exc))
+                case_id = case.get("id")
+                if case_id not in (None, ""):
+                    GlobalVar.set(TEARDOWN_FAIL_PREFIX + str(case_id), str(exc))
+                logger.error("后置清理步骤执行失败（不影响用例结论，但可能残留脏数据）：{}".format(exc))
             finally:
                 self._current_case = None
 
@@ -758,3 +772,13 @@ class BaseApi:
     def elapsed(self):
         """最近一次响应耗时（毫秒）。"""
         return self.res.get("elapsed") if self.res else None
+
+    @property
+    def teardown_failed(self):
+        """
+        最近一条用例的后置清理是否失败。
+
+        失败意味着「用例结论可能是通过的，但被测系统里可能残留了脏数据」，
+        用例层据此在报告中显式提示，避免清理失败被静默吞掉。
+        """
+        return bool(self.teardown_errors)

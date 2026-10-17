@@ -300,7 +300,8 @@ def isolate_state():
         ExcelUtil         工作簿缓存与脏标记
         SystemProfile     系统适配档案缓存（档案名受 RunConfig.SYSTEM 影响，必须隔离）
         RunConfig / DB_CONFIG   运行配置快照，避免用例改配置后互相影响
-        LogConfig / ReportConfig / AuthConfig / CIConfig   其余可配分组，同样需要快照
+        LogConfig / ReportConfig / AuthConfig / CIConfig / MaskConfig / NetworkConfig
+                          其余可配分组，同样需要快照
         ENV_OVERRIDES     被 AMSAPI_* 环境变量显式覆盖的项集合
 
     关于 ENV_OVERRIDES：它由 settings._load_env() 写入，语义是「哪些项被环境变量覆盖过」，
@@ -310,7 +311,8 @@ def isolate_state():
     因此这里必须连它一起快照还原。
     """
     config_holders = (settings.RunConfig, settings.LogConfig,
-                      settings.ReportConfig, settings.AuthConfig, settings.CIConfig)
+                      settings.ReportConfig, settings.AuthConfig, settings.CIConfig,
+                      settings.MaskConfig, settings.NetworkConfig)
     config_snapshots = [
         (holder, {key: value for key, value in vars(holder).items()
                   if not key.startswith("__") and not callable(value)})

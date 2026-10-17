@@ -36,7 +36,11 @@ HTTP 请求工具层
 
     也可在 send() 里显式传 params= / files= 覆盖自动判定（优先级最高）。
     3. 统一超时、证书校验、会话复用（keep-alive）
-    4. 统一返回结构，附带耗时，便于断言与日志排查
+    4. **代理处理**：访问环回 / 私网地址（127.0.0.1、10.x、192.168.x …）时
+       自动绕过系统代理 —— CI 机器与办公网普遍配置了 HTTP_PROXY，
+       若不处理，内网被测系统的请求会被代理拦截，报出指不到根因的 502。
+       开关见 conf.ini [network]（trust_env / auto_bypass_proxy / bypass_hosts）。
+    5. 统一返回结构，附带耗时，便于断言与日志排查
 
 返回结构：
     {
@@ -50,7 +54,9 @@ HTTP 请求工具层
     }
 """
 import json
+import re
 import time
+from urllib.parse import urlparse
 
 import requests
 
@@ -77,6 +83,72 @@ FORMAT_XML = "xml"
 FORMAT_TEXT = "text"
 
 
+# ----------------------------------------------------------------------
+# 代理绕过：环回 / 私网地址判定
+# ----------------------------------------------------------------------
+# 说明：requests 默认尊重 HTTP_PROXY / HTTPS_PROXY 等环境变量。
+# 但被测系统通常在内网，而 CI 机器上的代理是「出公网」用的，
+# 于是内网请求被代理拦下 → 502 / 连接失败，且报错完全指不到代理这一层。
+# 这里对「明确属于本机或内网」的地址直接不走代理，语义上不会有任何歧义。
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+# 私网 / 链路本地 / 环回网段前缀（IPv4）
+_INTERNAL_PREFIXES = ("127.", "10.", "192.168.", "169.254.")
+# 172.16.0.0/12
+_INTERNAL_172_RE = re.compile(r"^172\.(1[6-9]|2\d|3[01])\.")
+# 内网常见域名后缀
+_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".lan", ".corp")
+
+# 已提示过「自动绕过代理」的主机（避免每请求刷一行日志）
+_PROXY_BYPASS_WARNED = set()
+
+
+def is_internal_host(host):
+    """
+    判断主机名是否属于「本机 / 内网」。
+
+    覆盖：localhost、127.x、10.x、172.16-31.x、192.168.x、169.254.x（链路本地）、
+    以及 .local / .internal / .lan / .corp 等内网域名后缀。
+
+    :param host: 主机名或 IP（不带端口）
+    :return: bool
+    """
+    host = str(host or "").strip().strip("[]").lower()
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTS:
+        return True
+    if host.startswith(_INTERNAL_PREFIXES):
+        return True
+    if _INTERNAL_172_RE.match(host):
+        return True
+    return host.endswith(_INTERNAL_SUFFIXES)
+
+
+def _configured_bypass_hosts():
+    """
+    读取 conf.ini [network] bypass_hosts（逗号分隔；支持主机名与域名后缀）。
+
+    用于「被测系统在公网、但公司出口代理不允许直连」这类场景：
+    把目标域名填进来即可强制不走代理。
+    """
+    raw = str(getattr(settings.NetworkConfig, "BYPASS_HOSTS", "") or "")
+    return [item.strip().lower() for item in re.split(r"[,\s]+", raw) if item.strip()]
+
+
+def host_matches(host, patterns):
+    """主机是否命中给定模式（精确、后缀或以 . 开头的网段前缀）。"""
+    host = str(host or "").strip().lower()
+    if not host:
+        return False
+    for pattern in patterns:
+        if host == pattern or host.endswith(pattern):
+            return True
+        # 允许写 "10." 这样的网段前缀
+        if pattern.endswith(".") and host.startswith(pattern):
+            return True
+    return False
+
+
 class RequestSend:
     """统一请求发送器。建议在会话级 fixture 中复用同一实例，以复用 TCP 连接。"""
 
@@ -92,6 +164,49 @@ class RequestSend:
         self.encoding = encoding
         # 响应体解析格式：auto | json | xml | text（见 FORMAT_* 常量）
         self.response_format = (response_format or FORMAT_AUTO).lower()
+
+        # 是否沿用系统代理设置（conf.ini [network] trust_env）。
+        # 需在会话上关闭，因为 requests 是在会话层读取环境变量的。
+        if not bool(getattr(settings.NetworkConfig, "TRUST_ENV", True)):
+            try:
+                self.session.trust_env = False
+            except AttributeError:
+                pass
+
+    # ------------------------------------------------------------------
+    # 代理判定
+    # ------------------------------------------------------------------
+    def proxies_for(self, url):
+        """
+        计算本次请求应使用的代理设置。
+
+        :return: None 表示「沿用系统代理」（交给 requests 按环境变量处理）；
+                 {"http": None, "https": None} 表示「本请求不走任何代理」。
+
+        为什么用 {"http": None, "https": None} 而不是清空环境变量：
+            前者是「只影响这一次请求」的显式声明，不会污染进程级环境，
+            也不会干扰同进程里其它需要走代理的调用。
+        """
+        if not bool(getattr(settings.NetworkConfig, "TRUST_ENV", True)):
+            return None                        # 已整体忽略系统代理，无需再声明
+        if not bool(getattr(settings.NetworkConfig, "AUTO_BYPASS_PROXY", True)):
+            return None
+
+        host = urlparse(str(url)).hostname
+        if not host:
+            return None
+
+        needed = is_internal_host(host) or host_matches(host, _configured_bypass_hosts())
+        if not needed:
+            return None
+
+        if host not in _PROXY_BYPASS_WARNED:
+            _PROXY_BYPASS_WARNED.add(host)
+            logger.info(
+                "【代理】{} 被判定为内网/本机地址，本次请求不走系统代理"
+                "（如需改变该行为，调整 conf.ini [network] auto_bypass_proxy / bypass_hosts）"
+                .format(host))
+        return {"http": None, "https": None}
 
     # ------------------------------------------------------------------
     # 内部辅助
@@ -255,6 +370,10 @@ class RequestSend:
         req_kwargs.setdefault("cookies", cookies)
         req_kwargs.setdefault("timeout", self.timeout)
         req_kwargs.setdefault("verify", self.verify)
+        # 代理：内网 / 本机地址自动绕过系统代理（显式传入的 proxies 优先，见下方 kwargs.update）
+        proxies = self.proxies_for(url)
+        if proxies is not None:
+            req_kwargs.setdefault("proxies", proxies)
         req_kwargs.update(kwargs)
 
         # 日志：请求前

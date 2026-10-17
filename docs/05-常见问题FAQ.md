@@ -187,7 +187,9 @@ python -m pytest testcase --collect-only   # 显式指定路径
 1. 是否在公司内网 / 需要 VPN？
 2. `base_url` 或用例 url 是否写对（域名 + 端口）
 3. 端口是否正确（常见 9050 / 5050）
-4. 先做连通性测试：
+4. **本机是否配了系统代理？** 若目标是内网 / `127.0.0.1`，
+   请求可能被转发给代理（典型表现是 502）。框架已自动绕过，仍失败见 [Q57](#q57-请求内网地址返回-502日志里看不出服务端信息)
+5. 先做连通性测试：
 
 ```bash
 python -c "
@@ -557,6 +559,13 @@ AMSAPI_LOG_LEVEL=DEBUG AMSAPI_LOG_CONSOLE_LEVEL=DEBUG python main.py -k "id1"
 
 `DEBUG` 可看到完整的 headers / params / 响应体。
 
+> **日志会越写越大吗？** 不会。单文件达到 `[log] max_bytes`（默认 20MB）即轮转，
+> 最多保留 `backup_count`（默认 5）份；`keep_days` 大于 0 时还会清理超过该天数的
+> **框架自己生成**的历史日志（按 `file_name_format` 生成正则匹配，不会误删别人的文件）。
+> 用 `AMSAPI_LOG_MAX_BYTES` / `AMSAPI_LOG_BACKUP_COUNT` / `AMSAPI_LOG_KEEP_DAYS` 可临时覆盖。
+>
+> 日志里的口令、令牌会显示为 `dem****rd` 这类形态 —— 见 [Q58](#q58-日志--报告里口令变成-demrd是不是脱敏出问题了)。
+
 ### Q37 `legacy/` 目录能删吗
 
 可以。它保存了旧版本代码，仅作对照参考，**不参与测试执行**（`testpaths = testcase`）。
@@ -597,7 +606,7 @@ python main.py -m "not network" --report none
 python tools/mock_server.py
 ```
 
-推荐优先用第 1 条：它是**离线**的，不连被测环境，5 秒给出「框架是否被改坏」的结论。
+推荐优先用第 1 条：它是**离线**的，不连被测环境，10 秒给出「框架是否被改坏」的结论。
 详见 [07-单元测试](07-单元测试.md)。
 
 ### Q40 单元测试失败了，怎么判断是框架问题还是测试问题
@@ -608,7 +617,7 @@ python tools/mock_server.py
 | --- | --- | --- |
 | 断言值不符（如期望 `{"json": ...}` 实际 `None`） | 框架代码被改坏 | 修复代码；不要为了通过而改测试 |
 | `ImportError` / 找不到模块 | 新增文件后未加 `__init__.py`，或运行目录不对 | 在项目根目录执行 `python -m pytest tests` |
-| 依赖真实环境导致的失败 | 测试写错了（单元测试不应联网/连库） | 用 `FakeSession` / `FakePymysql` 替身，见 [07-单元测试 · 四条铁律](07-单元测试.md#五四条铁律) |
+| 依赖真实环境导致的失败 | 测试写错了（单元测试不应联网/连库） | 用 `FakeSession` / `FakePymysql` 替身，见 [07-单元测试 · 六条铁律](07-单元测试.md#五六条铁律) |
 | 串测失败（单跑通过、全量失败） | 用例间状态未隔离 | 依赖 conftest 的 `isolate_state`，不要手写 `setUp` 清理 |
 | 报「0 匹配 / 整体跳过」 | 冒烟环境变量影响了驱动模块加载 | 检查 `AMSAPI_SMOKE` / `AMSAPI_TAGS` |
 
@@ -619,7 +628,7 @@ python tools/mock_server.py
 
 不会。所有 Excel 相关用例都在 `tmp_path` 生成的副本上执行，并有专门用例锁定该行为
 （`test_readonly_run_does_not_touch_file`、`test_dirty_is_per_file`）。
-实测跑完全部 **978 条**用例后，`data/`、`config/conf.ini`、`report/` 的校验值完全不变。
+实测跑完全部 **1134 条**用例后，`data/`、`config/conf.ini`、`report/` 的校验值完全不变。
 
 ---
 
@@ -864,11 +873,119 @@ python -m pytest tests/test_repo_sanitized.py -q
 
 ---
 
-## 十一、通用排错流程
+## 十一、企业级加固（脱敏 / 代理 / 预检 / 清理失败）
+
+> 本节四个问题都来自 2.5.0 的企业级加固，是「看起来像故障、其实是保护机制」的典型。
+
+### Q57 请求内网地址返回 502，日志里看不出服务端信息
+
+**现象**：请求 `127.0.0.1` / `10.x` / `192.168.x` 这类地址返回 502，
+错误信息里没有任何业务线索。
+
+**原因**：本机或企业环境注入了 `HTTP_PROXY` / `HTTPS_PROXY`，
+而 `requests` 默认尊重代理环境变量 —— 于是**连本机与内网地址也被转发给了代理**。
+
+**好消息**：框架 2.5.0 起会对环回与内网地址**自动绕过代理**，正常情况下不会再遇到。
+若仍失败，按下面处理：
+
+```bash
+# 方式一：整个 session 不读系统代理与 CA 环境变量（内网专线场景）
+AMSAPI_TRUST_ENV=false python main.py
+
+# 方式二：追加需要绕过的域名（支持 *.corp 通配）
+AMSAPI_BYPASS_HOSTS="*.corp,10.20.30.40" python main.py
+
+# 方式三：传统做法，显式设置 NO_PROXY（框架内部已自动处理）
+NO_PROXY=127.0.0.1,localhost python main.py
+```
+
+对应配置见 `config/conf.ini` 的 `[network]` 段，
+说明见 [08-系统适配指南 · 4.9](08-系统适配指南.md#49-全局配置不属于档案mask-与-network)。
+
+### Q58 日志 / 报告里口令变成 `dem****rd`，是不是脱敏出问题了
+
+**不是问题，是保护机制在生效。**
+
+框架 2.5.0 起**默认开启脱敏**（`partial` 模式：保留前 3 后 2），覆盖三处落盘路径：
+日志（logging Filter）、Allure 附件（写入前）、报告目录（渲染后兜底）。
+
+| 你看到 | 含义 |
+| --- | --- |
+| `password` → `dem****rd` | 值被部分打码，仍可人工比对前后缀 |
+| `access-ticket` → `TK-****hr` | 同上 |
+| 整个值变成一排 `*` | `[mask] mode = full`（全遮蔽） |
+
+**要看原文**（仅本地调试，**切勿在 CI 上开**）：
+
+```bash
+AMSAPI_MASK_SENSITIVE=false python main.py -k id1 --report none
+```
+
+**某类字段没被脱敏**（如工号、身份证），在 `config/conf.ini` 补字段名：
+
+```ini
+[mask]
+extra_keys = idcard,phone,emp_no
+```
+
+字段名匹配会先按驼峰 / 下划线 / 中划线**拆词**再比对，
+所以 `design`、`tokenizer`、`passport` 这类词不会被误伤。
+
+### Q59 会话结束打印「teardown 汇总」告警，要不要管
+
+**要管，但它不一定是本次用例失败的原因。**
+
+`teardown` 是用例的清理步骤（删除测试数据之类）。它抛异常时框架的处理是：
+
+1. 该用例**不会**因此变红 —— 清理失败通常不改变「业务是否通过」的结论；
+2. 框架把它**登记**下来，并在该用例的 Allure 里留痕；
+3. 整个会话结束时汇总打印：
+
+```
+[警告] 本次有 2 条用例的 teardown 失败，可能留下脏数据：id2003, id2007
+```
+
+**怎么处理**：按告警里的 case_id，到日志里搜 `teardown 失败` 看具体异常。
+常见原因是「清理接口参数不对」或「数据已被他人删除」。
+确认可忽略时，去掉该用例的 `teardown` 即可。
+
+### Q60 `python tools/preflight.py` 是干什么的，输出怎么读
+
+**作用**：在执行用例**之前**先把环境问题暴露出来，
+避免把「环境坏了」误判成「业务失败了」。
+
+检查项：Python 版本 / 必需与可选依赖 / 生效配置 / 用例数据可读性 /
+可写目录 / 系统代理 / 目标连通性。
+
+**输出分三档**：
+
+| 档位 | 含义 | 处理 |
+| --- | --- | --- |
+| `[错误]` | 会导致根本跑不起来（数据文件不存在、目录不可写…） | **必须先修** |
+| `[警告]` | 会降级但不影响已有功能（如可选依赖 `jsonschema` 未装） | 按需处理 |
+| `[提示]` | 纯信息（Python 版本、生效档案、可执行用例条数） | 不用管 |
+
+```bash
+python tools/preflight.py                 # 常规预检
+python tools/preflight.py --no-target     # 跳过目标连通性检测（手里没有被测环境时）
+python tools/preflight.py --strict        # 有警告也返回非 0（把警告纳入门禁）
+python tools/preflight.py --json          # 机器可读输出（给流水线解析）
+```
+
+退出码：`0` = 无错误；非 `0` = 有错误（或 `--strict` 下存在警告）。
+
+---
+
+## 十二、通用排错流程
 
 按这个顺序走，80% 的问题能在第 3 步定位。
 
 ```
+第 0 步：先做环境预检（把环境问题与业务失败分开）
+         python tools/preflight.py
+         └─ 有 [错误]？ → 先修环境，别急着怀疑用例（见 Q60）
+         └─ 只有 [提示]？ → 环境没问题，继续往下
+
 第 1 步：看终端最后几行
          └─ 有 "passed/failed" 汇总？ → 用例在跑，是断言/数据问题 → 第 3 步
          └─ 直接报异常栈？           → 看异常类型，回本文对应章节
@@ -885,6 +1002,7 @@ python -m pytest tests/test_repo_sanitized.py -q
 第 4 步：看日志
          grep -E "【请求】|【关联】|<== |请求异常" "log/$(date +%Y_%m_%d).log"
          └─ 确认请求地址、变量替换结果、响应耗时
+         └─ 末尾有「teardown 汇总」告警？ → 见 Q59
 
 第 5 步：缩小范围
          python main.py -k "id<用例编号>" --report none
@@ -904,7 +1022,7 @@ python -m pytest tests/test_repo_sanitized.py -q
 
 ---
 
-## 十二、快速索引
+## 十三、快速索引
 
 | 关键词 | 跳转 |
 | --- | --- |
@@ -927,3 +1045,7 @@ python -m pytest tests/test_repo_sanitized.py -q
 | 有哪些配置项 / 怎么换环境 | [Q54](#q54-这个框架有哪些配置项我不想改代码就想换环境) |
 | 账号密码该写在哪 | [Q55](#q55-我接手的是一套新环境账号密码该写在哪) |
 | 怎么自查硬编码 / 开源合规 | [Q56](#q56-我不小心把真实地址账号写进代码了怎么自查) |
+| 内网请求 502 / 被系统代理拦截 | [Q57](#q57-请求内网地址返回-502日志里看不出服务端信息) |
+| 日志里口令被打码（`dem****rd`） | [Q58](#q58-日志--报告里口令变成-demrd是不是脱敏出问题了) |
+| 会话结束的「teardown 汇总」告警 | [Q59](#q59-会话结束打印teardown-汇总告警要不要管) |
+| 环境预检 `preflight.py` | [Q60](#q60-python-toolspreflightpy-是干什么的输出怎么读) |

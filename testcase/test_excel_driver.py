@@ -25,6 +25,7 @@ import pytest
 
 from api.base_api import CaseSkipped
 from config import settings
+from utils import allureutil
 from utils.excelutil import ExcelUtil
 from utils.logutil import logger
 
@@ -50,6 +51,19 @@ if not CASES:
 def _case_id(case):
     """为 pytest 生成可读的用例 id，如 id1[登录系统]。"""
     return "id{}[{}]".format(case.get("id"), case.get("title"))
+
+
+def _attach_teardown_warning(api):
+    """
+    后置清理失败时在报告中显式提示。
+
+    清理失败不改变用例结论（否则「清理接口挂了」会被误报成业务问题），
+    但它意味着被测系统可能残留脏数据，必须在报告里留下痕迹，
+    否则一轮「全绿」的背后是真脏数据，下一次构建会莫名失败。
+    """
+    if getattr(api, "teardown_failed", False):
+        allureutil.attach_text("后置清理失败（可能残留脏数据，请人工确认）",
+                               "\n".join(api.teardown_errors))
 
 
 @allure.epic("接口自动化")
@@ -94,6 +108,10 @@ class TestExcelDriver:
                 response = api_client.res
                 if settings.RunConfig.WRITE_BACK and response is not None:
                     _excel.update_result(case["__row__"], response, is_pass)
+
+            # 后置清理若失败，在报告中显式留痕（不影响本用例结论）
+            with allure.step("检查后置清理结果"):
+                _attach_teardown_warning(api_client)
 
     @classmethod
     def teardown_class(cls):

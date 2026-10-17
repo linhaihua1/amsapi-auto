@@ -48,13 +48,16 @@
 ```bash
 cd amsapi-auto
 pip install -r requirements.txt
-python -m pytest tests                   # 框架自测（离线，秒级，不依赖被测环境）
+pip install -r requirements-dev.txt     # 开发/CI 附加：flake8、覆盖率、xdist、重试等
+python tools/preflight.py               # 环境预检：依赖 / 配置 / 数据 / 目录 / 目标连通性
+python -m pytest tests                  # 框架自测（离线，秒级，不依赖被测环境）
 python main.py                          # 执行全部用例
 python tools/generate_report.py --open  # 打开 Allure 报告
 ```
 
 > `tests/` 是**框架自身的单元测试**（离线、不碰真实数据）；`testcase/` 是**业务接口用例**（需要真实环境）。
 > 详见 [单元测试](docs/07-单元测试.md)。
+> `tools/preflight.py --strict` 会让警告也返回非 0 退出码，适合在流水线里当门禁；日常本地跑不加 `--strict`。
 
 ### 手里没有被测系统？30 秒离线跑通
 
@@ -103,18 +106,20 @@ amsapi-auto/
 │   ├── response.py             ★ 响应判定层（status/code/success/errno/retcode/raw 六种风格）
 │   ├── hooks.py                ★ 请求/响应钩子与签名工具（时间戳、md5 签名、AES/RSA）
 │   ├── asserts.py              ★ 断言增强层（21 种字段级算子，expects 的执行引擎）
+│   ├── mask.py                 ★ 敏感信息脱敏（口令/令牌/票据，日志与报告落盘前打码）
+│   ├── metadata.py             ★ 执行元数据（git 提交 / 构建号 / 依赖版本 → Allure 环境页）
 │   ├── exceptions.py           ConfigError / CaseSkipped
 │   ├── project_path.py         项目路径常量
 │   └── read_config.py          ini 配置读取
 │
 ├── utils/                      工具层
-│   ├── requestsutil.py         HTTP 请求封装（多方法 / 自动 body / XML 原文 / 编码 / 耗时）
+│   ├── requestsutil.py         HTTP 请求封装（多方法 / 自动 body / XML 原文 / 编码 / 耗时 / 代理绕过）
 │   ├── excelutil.py            Excel 用例读写（工作簿缓存 + 延迟落盘）
 │   ├── yamlutil.py             YAML 用例读取
 │   ├── mysqlutil.py            MySQL 连接与执行（可选，惰性连接）
 │   ├── readmysql.py            MySQL 用例数据访问（可选）
-│   ├── logutil.py              日志（控制台 + 按天文件）
-│   └── allureutil.py           Allure 报告封装（附件 / 步骤 / 环境信息）
+│   ├── logutil.py              日志（控制台 + 按天文件 + 轮转/保留 + 脱敏 Filter）
+│   └── allureutil.py           Allure 报告封装（附件 / 步骤 / 环境信息 / 写入前脱敏）
 │
 ├── api/                        ★ 接口层（PO 层）
 │   ├── base_api.py             接口基类：URL 组装 / 参数化 / 认证 / 钩子 / 关联 / 断言 / 生命周期
@@ -136,6 +141,8 @@ amsapi-auto/
 │   ├── test_utils_*.py         工具层：请求、Excel/YAML、日志、Allure、MySQL
 │   ├── test_api_*.py           接口层：URL 组装、参数化、认证注入、钩子、断言、生命周期、分页
 │   ├── test_main_*.py          入口：参数解析、冒烟合并、CI 判定、报告决策
+│   ├── test_common_mask.py     脱敏规则与日志 Filter 集成
+│   ├── test_common_metadata.py 执行元数据采集
 │   ├── test_repo_sanitized.py  开源合规：全仓扫描，禁止残留真实地址/账号/口令
 │   └── test_testcase_layer.py  用例层：钩子、用例 id、SQL 驱动执行
 │
@@ -164,11 +171,15 @@ amsapi-auto/
 │
 ├── tools/
 │   ├── generate_report.py      生成 Allure HTML 报告
+│   ├── preflight.py            ★ 环境预检（依赖 / 配置 / 数据 / 目录 / 代理 / 连通性）
 │   └── mock_server.py          ★ 本地 mock 服务（离线体验用，零外部依赖）
 ├── main.py                     统一测试入口
 ├── Jenkinsfile                 Jenkins 流水线定义
 ├── pytest.ini                  pytest 配置
-├── requirements.txt            依赖清单
+├── requirements.txt            运行依赖清单（带版本上限）
+├── requirements-dev.txt        开发/校验依赖（flake8 / pytest-cov / xdist / jsonschema / cryptography）
+├── .flake8                     风格检查配置（`python -m flake8 .`）
+├── pyproject.toml              覆盖率配置（pytest 配置仍在 pytest.ini）
 ├── CHANGELOG.md                变更记录
 ├── .gitignore                  版本管理忽略规则
 │
@@ -230,7 +241,9 @@ python main.py --collect-only       # 只收集不执行（完全只读，排查
 
 python -m pytest tests              # ★ 框架单元测试（离线自检，改代码后必跑）
 python -m pytest tests -q           # 同上，简洁输出
+python -m flake8 .                  # ★ 风格检查（0 问题才算过）
 
+python tools/preflight.py           # ★ 环境预检（依赖/配置/数据/目录/代理/连通性）
 python tools/generate_report.py --clean --open   # 单独渲染并打开报告
 ```
 
@@ -294,6 +307,21 @@ file_name_format = %Y_%m_%d                  ; 日志文件名格式（按天滚
 format = %(asctime)s | %(levelname)-7s | %(filename)s:%(lineno)d | %(message)s
 date_format = %Y-%m-%d %H:%M:%S
 root_name = amsapi                           ; logger 根名称
+mask_sensitive = true                        ; 日志/报告中的口令、令牌一律打码（强烈建议保持 true）
+max_bytes = 20971520                         ; 单文件上限（字节），超出自动轮转 .1/.2；0 = 不限
+backup_count = 5                             ; 轮转备份个数
+keep_days = 30                               ; 历史日志保留天数；0 = 不清理
+
+[mask]
+mode = partial                               ; partial = 保留首尾少量字符 | full = 全遮蔽
+keep_prefix = 3                              ; partial 模式保留前缀字符数
+keep_suffix = 2                              ; partial 模式保留后缀字符数
+extra_keys =                                 ; 追加敏感字段名（逗号分隔），如 mobile,idcard
+
+[network]
+trust_env = true                             ; 是否沿用系统代理（HTTP_PROXY / HTTPS_PROXY）
+auto_bypass_proxy = true                     ; 内网/环回地址自动绕过代理（必须为 true）
+bypass_hosts =                               ; 额外不走代理的主机，如 corp.internal,10.
 
 [auth]
 refresh_ahead = 60                           ; OAuth2 令牌到期前多少秒提前续期
@@ -310,6 +338,9 @@ detect_env_vars = JENKINS_URL,JENKINS_HOME,GITLAB_CI,BUILD_NUMBER,GITHUB_ACTIONS
 | 目标 | 变量 |
 | --- | --- |
 | `conf.ini` 的项 | `AMSAPI_<项名大写>`，如 `AMSAPI_TIMEOUT`、`AMSAPI_LOG_LEVEL` |
+| `conf.ini` `[mask]` 段 | `AMSAPI_MASK_SENSITIVE`、`AMSAPI_MASK_MODE`、`AMSAPI_MASK_EXTRA_KEYS` |
+| `conf.ini` `[network]` 段 | `AMSAPI_TRUST_ENV`、`AMSAPI_AUTO_BYPASS_PROXY`、`AMSAPI_BYPASS_HOSTS` |
+| `conf.ini` `[log]` 轮转项 | `AMSAPI_LOG_MAX_BYTES`、`AMSAPI_LOG_KEEP_DAYS` |
 | 系统档案 `[env]` 段 | `AMSAPI_<字段名大写>`，如 `AMSAPI_ENCODING`、`AMSAPI_RESPONSE_FORMAT` |
 | 系统档案 `[hosts]` 段 | `AMSAPI_HOST_<别名大写>`，如 `AMSAPI_HOST_ADMIN` |
 | 系统档案 `[auth]` 段 | `AMSAPI_AUTH_<字段名大写>`，如 `AMSAPI_AUTH_CLIENT_SECRET` |
@@ -471,8 +502,35 @@ GitHub Actions 示例与故障排查）。
 | jsonschema | ≥4.0 | 否（`schema:` 断言） |
 | cryptography | ≥3.4 | 否（AES 加解密 / RSA 签名） |
 
+**开发 / CI 附加依赖**（`pip install -r requirements-dev.txt`，不影响运行时）：
+
+| 组件 | 版本 | 用途 |
+| --- | --- | --- |
+| flake8 | ≥6.0 | 静态检查（CI 门禁） |
+| pytest-cov | ≥4.0 | 覆盖率统计与门槛判定 |
+| pytest-xdist | ≥3.3 | 多进程并行加速 |
+| pytest-rerunfailures | ≥12.0 | 网络抖动重试 |
+| pytest-timeout | ≥2.1 | 防止用例挂死 |
+| jsonschema / cryptography | — | 可选能力（装了就自动启用，不装自动降级） |
+
 **缺少可选依赖时框架会自动降级并给出安装提示，不影响已有功能**。
+`tools/preflight.py` 会明确列出「已装 / 未装」及影响的能力。
 详见 [系统适配指南 · 可选依赖](docs/08-系统适配指南.md#48-可选依赖一览)。
+
+**企业级加固能力**（安全合规 / 环境健壮性 / 可观测性）：
+
+| 能力 | 实现 | 开关 / 入口 |
+| --- | --- | --- |
+| 敏感信息脱敏 | `common/mask.py` + 日志 Filter + 附件写入前 + 报告落盘后兜底 | `[mask]` / `AMSAPI_MASK_SENSITIVE`（**默认开**） |
+| 系统代理绕过 | `utils/requestsutil.proxies_for()`（环回 / 私网 / `*.local` 自动绕过） | `[network]` / `AMSAPI_TRUST_ENV`、`AMSAPI_BYPASS_HOSTS` |
+| 执行元数据 | `common/metadata.py` → Allure「环境」页（运行位置 / Python / OS / 依赖版本；git 提交与构建号**有则显示**） | 自动，无需配置 |
+| 日志轮转与保留 | `utils/logutil.py` | `[log] max_bytes / backup_count / keep_days` |
+| teardown 失败登记 | `api/base_api.py` + `testcase/conftest.py` 会话收尾汇总告警 | 自动 |
+| 环境预检 | `tools/preflight.py` | `--no-target` / `--strict` / `--json` |
+| 风格门禁 | `.flake8` + flake8 | `python -m flake8 .` |
+| 开源合规守卫 | `tests/test_repo_sanitized.py` | `python -m pytest tests/test_repo_sanitized.py -q` |
+
+> 设计取舍与实现细节见 [框架设计 · 4.11 企业级加固](docs/03-框架设计.md#411-企业级加固安全--健壮性--可观测性250)。
 
 ---
 
@@ -506,10 +564,11 @@ Excel 与 YAML 各一份填空式模板，四条示例覆盖「登录取票 → 
 
 | 约束 | 落地方式 |
 | --- | --- |
-| 不预置真实地址 / 账号 / 口令 / 密钥 | `conf.ini` 的 `[db]` 全部留空；示例用例 url 一律**相对路径** |
+| 不预置真实地址 / 账号 / 口令 / 密钥 | `conf.ini`（含 `conf.ci.ini`）的 `[db]` 全部留空；示例用例 url 一律**相对路径** |
 | 示例档案用占位域名 | `*.example.com` / `*.local`，真实域名由 `AMSAPI_BASE_URL` 注入 |
 | 示例用例用通用业务值 | `demo_user` / `demo-app` / `demo-type` … |
-| 自动化守卫 | `tests/test_repo_sanitized.py` 扫描全仓文件，一旦有人误提交真实信息立刻失败 |
+| **运行期产出不泄露口令 / 令牌** | `[log] mask_sensitive = true` + `[mask]` 生效：日志与 Allure 附件在**写入前**统一打码 |
+| 自动化守卫 | `tests/test_repo_sanitized.py` 扫描全仓（含 `config/**/*.ini`）文件与弱口令，一旦有人误提交真实信息立刻失败 |
 | 历史执行产物不入库 | `.gitignore` 忽略 `log/*.log`、`report/*`、`.coverage` |
 
 ---
@@ -523,13 +582,17 @@ Excel 与 YAML 各一份填空式模板，四条示例覆盖「登录取票 → 
 | 依赖方向 | 禁止上层被下层引用（如 `api/` 不得 import `testcase/`） |
 | 数据契约 | 用例数据必须是含 `url`/`method` 等字段的 dict，见 [开发指南](docs/04-开发指南.md#52-数据契约必须遵守) |
 | **开源合规** | 提交前不得出现真实内网地址、真实账号口令、真实用户隐私；`python -m pytest tests/test_repo_sanitized.py -q` 必须绿 |
-| 变更同步 | 改字段/配置/断言需同步更新 `docs/`，重要变更记入 `CHANGELOG.md` |
+| **脱敏** | 日志/报告落盘前必须经 `common/mask.py` 打码；新增会打印请求/响应的代码不得绕过 `mask.mask_payload()` |
+| **静态检查** | `python -m flake8 .` 必须 0 问题（配置见 `.flake8`，行长上限 120） |
+| **变更同步** | 改字段/配置/断言需同步更新 `docs/`，重要变更记入 `CHANGELOG.md` |
 
 提交前自检：
 
 ```bash
+python -m flake8 .                            # 静态检查（0 问题）
 python -m compileall -q api common config utils testcase tools main.py
-python -m pytest tests -q                    # 框架自测（含开源合规扫描）
+python tools/preflight.py                     # 环境预检（0 错误）
+python -m pytest tests -q                     # 框架自测（含开源合规扫描 + 覆盖率）
 python main.py --collect-only
 python main.py --report none
 ```

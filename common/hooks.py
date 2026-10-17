@@ -478,7 +478,7 @@ def make_aes_hook(key, fields=("data",), iv=None, mode="ECB", alg_field=None):
 
 
 def make_decrypt_response_hook(key, fields=("data",), iv=None, mode="ECB",
-                              drop_fields=()):
+                               drop_fields=()):
     """
     生成「响应字段解密」钩子：把响应体中的密文字段解密回原文。
 

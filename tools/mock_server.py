@@ -36,13 +36,11 @@
 停止：Ctrl + C
 """
 import argparse
-import base64
 import hashlib
 import json
 import random
 import string
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -248,9 +246,10 @@ def handle_org_tree(handler, method, params):
     page = int(params.get("page") or 1)
     size = int(params.get("size") or 20)
     total = 5
+    start = (page - 1) * size + 1
+    end = min(total, page * size) + 1
     rows = [{"code": "{}-{}".format(params.get("code") or "org", i),
-             "name": "组织节点{}".format(i)} for i in range((page - 1) * size + 1,
-                                                          min(total, page * size) + 1)]
+             "name": "组织节点{}".format(i)} for i in range(start, end)]
     handler._send({"status": 200, "message": "success", "rows": rows, "total": total})
 
 

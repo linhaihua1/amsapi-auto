@@ -39,6 +39,7 @@ import sys
 
 import pytest
 
+from common import mask
 from config import settings
 
 # 支持的报告类型
@@ -205,6 +206,8 @@ def main():
         "冒烟（标签 {}）".format(settings.RunConfig.TAGS) if smoke else "全量"))
     print("数据源     : {}".format(settings.RunConfig.DATA_SOURCE))
     print("结果回写   : {}".format(settings.RunConfig.WRITE_BACK))
+    print("敏感脱敏   : {}".format(
+        "开启（{}）".format(settings.MaskConfig.MODE) if settings.MaskConfig.ENABLED else "关闭"))
     print("CI 环境    : {}".format("是" if in_ci else "否"))
     print("报告类型   : {}".format(report_type + ("（仅收集用例，不产出报告）" if collect_only else "")))
     if report_type in ("allure", "both"):
@@ -225,11 +228,24 @@ def main():
         else:
             _render_allure_report()
 
+    # 最终兜底脱敏：报告中可能含第三方插件直接落盘的内容
+    # （如 allure-pytest 把 parametrize 的整条用例写成报告参数），
+    # 渲染完成后再统一扫一遍，确保**归档出去的制品里没有明文口令 / 令牌**。
+    _sanitize_reports()
+
     print("=" * 70)
     print("测试结束，退出码 = {}（0 表示全部通过）".format(exit_code))
     print("=" * 70)
 
     sys.exit(exit_code)
+
+
+def _sanitize_reports():
+    """报告目录落盘后兜底脱敏（重复执行无副作用；脱敏关闭时不做任何事）。"""
+    try:
+        mask.sanitize_dir(settings.REPORT_DIR)
+    except Exception:                     # 兜底动作绝不能影响退出码
+        pass
 
 
 if __name__ == "__main__":

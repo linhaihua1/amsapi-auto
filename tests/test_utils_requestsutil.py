@@ -11,7 +11,7 @@ import requests
 
 from tests.conftest import FakeResponse, FakeSession
 from utils.requestsutil import (CT_FORM, CT_JSON, CT_MULTIPART, CT_TEXT, CT_XML,
-                                RequestSend)
+                                RequestSend, host_matches, is_internal_host)
 
 
 # ======================================================================
@@ -88,8 +88,8 @@ class TestBuildKwargs:
 
     def test_delete_with_json_content_type_uses_body(self):
         """REST 批量删除常见写法：DELETE + JSON 请求体。"""
-        kwargs = self.sender._build_kwargs("delete", {"ids": [1, 2]},
-                                          {"Content-Type": CT_JSON})
+        headers = {"Content-Type": CT_JSON}
+        kwargs = self.sender._build_kwargs("delete", {"ids": [1, 2]}, headers)
         assert kwargs == {"json": {"ids": [1, 2]}}
 
     def test_delete_with_form_content_type(self):
@@ -290,3 +290,94 @@ class TestSend:
         result = RequestSend(session=session).api_run("http://x", "get", data={"a": 1})
         assert result["code"] == 200
         assert session.last_call["kwargs"]["params"] == {"a": 1}
+
+
+# ======================================================================
+# 五、代理绕过（内网直连不被系统代理拦截）
+# ======================================================================
+class TestIsInternalHost:
+    """
+    企业环境下 CI 机器普遍配置了「出公网」代理，而被测系统在内网。
+    若不绕过，内网请求会被代理拦下，报出指不到根因的 502。
+    """
+
+    @pytest.mark.parametrize("host", [
+        "localhost", "127.0.0.1", "127.1.2.3", "0.0.0.0", "::1",
+        "10.0.0.5", "192.168.1.100", "169.254.1.1",
+        "172.16.0.1", "172.20.10.3", "172.31.255.254",
+        "sso.local", "api.internal", "erp.corp", "gw.lan",
+        "LOCALHOST", " 10.1.1.1 ", "[::1]",
+    ])
+    def test_internal(self, host):
+        assert is_internal_host(host) is True, host
+
+    @pytest.mark.parametrize("host", [
+        "api.example.com", "8.8.8.8", "172.15.0.1", "172.32.0.1",
+        "192.169.1.1", "100.64.0.1", "", None,
+    ])
+    def test_external(self, host):
+        assert is_internal_host(host) is False, host
+
+
+class TestHostMatches:
+    def test_exact(self):
+        assert host_matches("api.corp.com", ["api.corp.com"]) is True
+
+    def test_suffix(self):
+        assert host_matches("a.corp.internal", ["corp.internal"]) is True
+
+    def test_network_prefix(self):
+        assert host_matches("10.9.9.9", ["10."]) is True
+
+    def test_no_match(self):
+        assert host_matches("api.example.com", ["corp.internal"]) is False
+        assert host_matches("", ["x"]) is False
+
+
+class TestProxiesFor:
+    def test_internal_host_bypasses_proxy(self):
+        sender = RequestSend(session=FakeSession(FakeResponse(payload={})))
+        assert sender.proxies_for("http://127.0.0.1:18080/v1/users/login") == {
+            "http": None, "https": None}
+
+    def test_public_host_keeps_env_proxy(self):
+        sender = RequestSend(session=FakeSession(FakeResponse(payload={})))
+        assert sender.proxies_for("https://api.example.com/v1/users") is None
+
+    def test_auto_bypass_can_be_disabled(self):
+        from config import settings
+        settings.NetworkConfig.AUTO_BYPASS_PROXY = False
+        try:
+            sender = RequestSend(session=FakeSession(FakeResponse(payload={})))
+            assert sender.proxies_for("http://10.0.0.1/x") is None
+        finally:
+            settings.NetworkConfig.AUTO_BYPASS_PROXY = True
+
+    def test_trust_env_false_means_no_proxy_handling(self):
+        from config import settings
+        settings.NetworkConfig.TRUST_ENV = False
+        try:
+            sender = RequestSend(session=FakeSession(FakeResponse(payload={})))
+            assert sender.proxies_for("http://10.0.0.1/x") is None
+        finally:
+            settings.NetworkConfig.TRUST_ENV = True
+
+    def test_bypass_hosts_config_for_public_domain(self):
+        from config import settings
+        settings.NetworkConfig.BYPASS_HOSTS = "corp.internal,10."
+        try:
+            sender = RequestSend(session=FakeSession(FakeResponse(payload={})))
+            assert sender.proxies_for("https://sso.corp.internal/token") is not None
+        finally:
+            settings.NetworkConfig.BYPASS_HOSTS = ""
+
+    def test_send_passes_proxies_for_internal_url(self):
+        session = FakeSession(FakeResponse(payload={"status": 200}))
+        RequestSend(session=session).send("http://127.0.0.1:18080/v1/x", "get")
+        assert session.last_call["kwargs"]["proxies"] == {"http": None, "https": None}
+
+    def test_send_does_not_touch_proxies_for_public_url(self):
+        """公网地址必须维持原有行为（沿用系统代理），不做任何额外声明。"""
+        session = FakeSession(FakeResponse(payload={"status": 200}))
+        RequestSend(session=session).send("https://api.example.com/x", "get")
+        assert "proxies" not in session.last_call["kwargs"]

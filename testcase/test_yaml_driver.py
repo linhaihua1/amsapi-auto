@@ -16,6 +16,7 @@ import pytest
 
 from api.base_api import CaseSkipped
 from config import settings
+from utils import allureutil
 from utils.logutil import logger
 from utils.yamlutil import read_cases
 
@@ -80,4 +81,10 @@ class TestYamlDriver:
                 api_client.run_case(case)
             except CaseSkipped as exc:
                 pytest.skip(str(exc))
+
+        # 后置清理失败时在报告中显式留痕（用例结论不受影响，但可能有脏数据残留）
+        if getattr(api_client, "teardown_failed", False):
+            allureutil.attach_text("后置清理失败（可能残留脏数据，请人工确认）",
+                                   "\n".join(api_client.teardown_errors))
+
         logger.info("YAML 用例通过：{}".format(title))

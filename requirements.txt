@@ -1,36 +1,37 @@
-# 接口自动化测试框架依赖
+# 接口自动化测试框架依赖（运行必需 + 报告）
 # 安装：pip install -r requirements.txt
+#
+# 企业级约定：
+#   1. 每个依赖都给出**上限**（< 下一大版本）—— 避免某天流水线因为上游发新版
+#      而集体变红；这类问题在「当天就要出报告」时最致命。
+#   2. 需要可复现的构建时，基于本文件生成锁文件：
+#          pip freeze > requirements.lock.txt
+#      或：pip-compile requirements.txt -o requirements.lock.txt
+#   3. 开发与 CI 门禁相关依赖（lint / 并行 / 重试 / 覆盖率 / 可选增强）见 requirements-dev.txt。
 
-# 测试框架与报告
-pytest>=7.0
-pytest-html>=3.1
-allure-pytest>=2.13
+# ---- 测试框架与报告 ----
+pytest>=7.0,<10
+pytest-html>=3.1,<5
+allure-pytest>=2.13,<3
 
-# 可选：框架单元测试的覆盖率统计（pytest tests --cov=...）
-pytest-cov>=4.0
+# ---- HTTP 请求 ----
+requests>=2.25,<3
 
-# 可选：Allure HTML 报告渲染还需 allure 命令行工具（依赖 Java）
+# ---- Excel 数据源读写 ----
+openpyxl>=3.0,<4
+
+# ---- YAML 数据源读写 ----
+PyYAML>=5.4,<7
+
+# ---- MySQL 数据源（data_source = mysql 时需要）----
+PyMySQL>=1.0,<2
+
+# ---------------------------------------------------------------------------
+# 可选增强依赖（未安装时框架自动降级，不影响已有功能）：
+#     jsonschema      expects 的 schema 断言
+#     cryptography    AES 加解密 / RSA 签名钩子（政务、财务系统常见）
+# 已统一收进 requirements-dev.txt，按需安装。
+# ---------------------------------------------------------------------------
+# Allure HTML 报告渲染还需 allure 命令行工具（依赖 Java）
 # 下载：https://github.com/allure-framework/allure2/releases
 # 校验：allure --version
-
-# HTTP 请求
-requests>=2.25
-
-# Excel 数据源读写
-openpyxl>=3.0
-
-# YAML 数据源读写
-PyYAML>=5.4
-
-# MySQL 数据源（data_source = mysql 时需要）
-PyMySQL>=1.0
-
-# ---------------------------------------------------------------------------
-# 以下为「可选增强依赖」：未安装时框架自动降级并给出安装提示，不影响已有功能。
-# 需要时单独安装：
-#     pip install jsonschema cryptography
-# ---------------------------------------------------------------------------
-# 字段级断言中的 schema: 算子（JSON Schema 校验）
-# jsonschema>=4.0
-# AES 加解密 / RSA 签名钩子（政务、财务系统的报文加密常见）
-# cryptography>=3.4

@@ -9,7 +9,6 @@
 
 全部在 tmp_path 的副本上进行，绝不触碰 data/api_tables.xlsx。
 """
-import os
 import shutil
 
 import openpyxl

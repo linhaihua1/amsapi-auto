@@ -5,7 +5,8 @@ pytest 全局配置（conftest.py）
 pytest 会自动加载本文件，无需手动 import。职责：
     1. 注册自定义 marker（避免告警，并支持 -m 筛选）
     2. 补全 Allure 结果目录，使「直接运行 pytest」也能产出 Allure 原始数据
-    3. 会话开始 / 结束钩子：清空变量池、写入报告环境信息、结果落盘
+    3. 会话开始 / 结束钩子：清空变量池、写入报告环境信息（含执行元数据）、
+       结果落盘、汇总后置清理失败
     4. 提供跨用例复用的 fixture
 
 运行示例：
@@ -16,7 +17,8 @@ pytest 会自动加载本文件，无需手动 import。职责：
 """
 import pytest
 
-from api.base_api import BaseApi
+from api.base_api import TEARDOWN_FAIL_PREFIX, BaseApi
+from common import mask, metadata
 from common.profile import load_profile
 from common.variable import GlobalVar
 from config import settings
@@ -95,12 +97,13 @@ def pytest_sessionstart(session):
     need_allure = settings.RunConfig.REPORT_TYPE in ("allure", "both")
 
     # 报告「环境」页信息（标题/项目名取自 conf.ini [report]，不再写死）
+    run_mode = ("冒烟（标签 {}）".format(settings.RunConfig.TAGS)
+                if settings.RunConfig.SMOKE_ONLY else "全量")
     env_info = {
         "项目": settings.ReportConfig.PROJECT,
         "报告标题": settings.ReportConfig.TITLE,
         "测试环境": settings.RunConfig.ENV,
-        "执行模式": "冒烟（标签 {}）".format(settings.RunConfig.TAGS)
-                    if settings.RunConfig.SMOKE_ONLY else "全量",
+        "执行模式": run_mode,
         "数据源": settings.RunConfig.DATA_SOURCE,
         "结果回写": str(settings.RunConfig.WRITE_BACK),
         "Allure可用": str(allureutil.ALLURE_AVAILABLE),
@@ -108,6 +111,14 @@ def pytest_sessionstart(session):
     # 系统适配信息（主域名 / 域名别名 / 响应判定规则 / 认证方式 / 钩子）——
     # 换被测系统时，从报告首页一眼就能看出本次跑的是哪套适配规则
     env_info.update(load_profile().describe())
+
+    # 执行元数据（构建号 / git 提交 / 分支 / Python 与依赖版本）——
+    # 报告被单独转发或归档后，仍能确认「这份报告对应哪次构建、哪次提交」
+    env_info.update(metadata.collect())
+
+    # 敏感信息脱敏状态也写进报告：看到报告的人需要知道口令类字段是打过码的
+    env_info["敏感信息脱敏"] = "开启（{}）".format(settings.MaskConfig.MODE) \
+        if settings.MaskConfig.ENABLED else "关闭"
 
     # 仅在需要 Allure 报告时写盘；--report none / --collect-only 不产生任何文件
     if need_allure:
@@ -120,10 +131,51 @@ def pytest_sessionstart(session):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """整个测试会话结束后执行一次：把缓存的结果统一落盘。"""
+    """整个测试会话结束后执行一次：把缓存的结果统一落盘，并汇总后置清理失败。"""
     if settings.RunConfig.WRITE_BACK:
         ExcelUtil.flush()
+    _warn_teardown_failures()
+    _sanitize_reports()
     logger.info("测试会话结束，exitstatus = {}".format(exitstatus))
+
+
+def _sanitize_reports():
+    """
+    对报告目录做一次「落盘后兜底脱敏」。
+
+    为什么必须兜这一层：
+        Allure 的 pytest 插件会把 `@pytest.mark.parametrize` 的每个参数
+        自动写成报告参数，而框架传的是**整条用例数据**
+        （形如 `case = "{'password': 'demo_password'}"`）。
+        这条路径由插件直接落盘，不经过框架的 `attach_*`；
+        若不兜一遍，构建制品里仍会残留明文口令。
+    """
+    changed = mask.sanitize_dir(settings.REPORT_DIR)
+    if changed:
+        logger.info("报告产物脱敏完成：{} 个文件已打码".format(changed))
+
+
+def _warn_teardown_failures():
+    """
+    汇总「后置清理失败」的用例并告警。
+
+    为什么不能只在单条用例里记一行 error 日志：
+        teardown 失败不影响用例结论，于是整轮跑完可能「全绿」，
+        但被测系统里已经躺着脏数据 —— 下一次构建会因此出现莫名其妙的失败，
+        而那时已经看不到原始线索了。会话级汇总能把这件事明确摆到台面上。
+    """
+    failed = {key[len(TEARDOWN_FAIL_PREFIX):]: value
+              for key, value in GlobalVar.all().items()
+              if key.startswith(TEARDOWN_FAIL_PREFIX)}
+    if not failed:
+        return
+
+    logger.warning("=" * 70)
+    logger.warning("有 {} 条用例的后置清理失败，被测系统可能残留脏数据：".format(len(failed)))
+    for case_id, reason in sorted(failed.items()):
+        logger.warning("    用例 id={} -> {}".format(case_id, reason))
+    logger.warning("提示：用例结论不受影响，但请人工确认这些数据是否需要清理。")
+    logger.warning("=" * 70)
 
 
 # ----------------------------------------------------------------------

@@ -14,7 +14,7 @@
 [CI 流水线] 构建 / 打包
      │
      ▼
-[框架单元测试] ★ 离线自检（约 5 秒）—— 框架自身坏了就没必要往下跑
+[框架单元测试] ★ 离线自检（约 10 秒）—— 框架自身坏了就没必要往下跑
      │
      ▼
 [CD 流水线] 部署到目标环境
@@ -151,6 +151,8 @@ $ python main.py --collect-only --smoke
 | `AMSAPI_LOG_LEVEL` | `DEBUG` | 文件日志级别 |
 | `AMSAPI_LOG_CONSOLE_LEVEL` | `DEBUG` | 控制台日志级别（CI 里常调成 `INFO` 减噪） |
 | `AMSAPI_LOG_ROOT_NAME` | `amsapi` | logger 名 |
+| `AMSAPI_LOG_MAX_BYTES` | `20971520` | 单文件日志上限（字节），超出轮转；`0` = 不限 |
+| `AMSAPI_LOG_KEEP_DAYS` | `30` | 历史日志保留天数；`0` = 不清理 |
 | `AMSAPI_REPORT_TITLE` | `接口自动化测试` | 报告标题 |
 | `AMSAPI_REPORT_PROJECT` | `amsapi-auto` | 报告项目名 |
 | `AMSAPI_REPORT_HTML_NAME` | `report.html` | pytest-html 文件名 |
@@ -158,6 +160,25 @@ $ python main.py --collect-only --smoke
 | `AMSAPI_OAUTH2_REFRESH_AHEAD` | `60` | OAuth2 令牌到期前多少秒续期 |
 | `AMSAPI_OAUTH2_TOKEN_TIMEOUT` | `10` | 取令牌请求超时（秒） |
 | `AMSAPI_OAUTH2_TOKEN_VERIFY` | `false` | 取令牌时校验证书 |
+
+**脱敏 / 网络**（对应 `conf.ini` 的 `[mask]` `[log] mask_sensitive` `[network]` 三组，**CI 中强烈建议保持默认**）：
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `AMSAPI_MASK_SENSITIVE` | `true` | 日志 / 报告落盘前是否打码口令、令牌 |
+| `AMSAPI_MASK_MODE` | `partial` | `partial` 保留首尾少量字符 / `full` 全遮蔽 |
+| `AMSAPI_MASK_EXTRA_KEYS` | （空） | 追加敏感字段名，如 `mobile,idcard` |
+| `AMSAPI_TRUST_ENV` | `true` | 是否沿用系统代理（`HTTP_PROXY` / `HTTPS_PROXY`） |
+| `AMSAPI_AUTO_BYPASS_PROXY` | `true` | 访问内网 / 环回地址时自动绕过代理 |
+| `AMSAPI_BYPASS_HOSTS` | （空） | 额外不走代理的主机，如 `corp.internal,10.` |
+
+> **为什么 CI 里要开脱敏**：Allure 结果与日志会作为构建制品归档、被流转给非相关同学。
+> 若其中含明文口令 / 令牌，等价于口令外泄。`AMSAPI_MASK_MODE=full` 适合对外共享的报告。
+>
+> **为什么 CI 里要绕过代理**：CI 机器普遍配置「出公网」代理，若被测系统在内网，
+> 请求会被代理拦截并报出**指不到根因的 502**（`upstream connect failed`）。
+> 默认的 `auto_bypass_proxy = true` 已覆盖 `127.0.0.1` / `10.` / `172.16-31.` / `192.168.` /
+> `*.local` 等常见内网地址；其余主机用 `AMSAPI_BYPASS_HOSTS` 补。
 
 **系统适配档案逐项覆盖**（改环境不必改档案文件）：
 
@@ -261,6 +282,13 @@ AMSAPI_CONF_FILE=config/conf.ci.ini python main.py --smoke --report allure
 | --- | --- |
 | 跳过本地 HTML 渲染 | 只产出 `report/allure-results/`，由流水线的 Allure 插件渲染，**显著缩短构建时长** |
 | 打印 CI 标识 | 启动摘要中显示 `CI 环境: 是`，便于确认参数是否正确注入 |
+| 解析构建信息 | 采集 `BUILD_NUMBER` / `GITLAB_CI_PIPELINE_ID` / `GITHUB_RUN_NUMBER` 与 git 提交，写入 Allure「环境」页 |
+| 敏感信息脱敏 | 默认开启，日志与 Allure 附件写入前打码 |
+| 内网绕过代理 | 默认开启，访问内网被测系统不被「出公网」代理拦截 |
+| teardown 失败汇总 | 会话结束时汇总「清理失败」的用例编号，避免脏数据被当成全绿 |
+
+CI 检测**同时影响报告标题**：Allure「环境」页会带上构建号与 git 提交，
+因此「这份报告对应哪次代码提交」一目了然。
 
 如需在 CI 中也渲染本地 HTML（例如把报告作为构建产物分发）：
 
@@ -290,15 +318,22 @@ AMSAPI_RENDER_ALLURE=1 python main.py --report allure
 仓库中的 `Jenkinsfile` 已包含完整逻辑：
 
 ```
-检出代码 → 准备依赖 → 数据与配置自检 → 框架单元测试 → 冒烟测试 / 全量回归 → 归档 + Allure 报告
+检出代码 → 准备依赖 → 静态检查 → 环境预检 → 数据与配置自检 → 框架单元测试（覆盖率门槛）
+        → 冒烟测试 / 全量回归 → 归档 + Allure 报告
 ```
 
 | 阶段 | 命令 | 说明 |
 | --- | --- | --- |
+| **静态检查** | `python -m flake8 .` | 0 问题才继续（配置见 `.flake8`） |
+| **环境预检** | `python tools/preflight.py` | 依赖 / 配置 / 数据 / 目录 / 连通性；0 错误才继续 |
 | 数据与配置自检 | `python main.py --collect-only` | 只读，确认用例能被读到 |
-| **框架单元测试** | `python -m pytest tests -q` | 离线约 5 秒，验证框架自身没被改坏 |
+| **框架单元测试** | `python -m pytest tests -q` | 离线约 10 秒，验证框架自身没被改坏 |
+| 覆盖率 | `pytest --cov=... --cov-fail-under=${COVERAGE_MIN}` | 低于门槛即失败（默认 `COVERAGE_MIN=80`，可按需收紧） |
 | 冒烟测试 | `python main.py --smoke --report allure` | `RUN_MODE=smoke` 时执行 |
 | 全量回归 | `python main.py --report allure` | `RUN_MODE=full` 时执行 |
+
+> 前两个 stage 是**快速失败**门禁：代码风格或环境问题在 10 秒内暴露，
+> 不必等几分钟的业务用例跑完才发现。
 
 ### 5.3 构建参数说明
 
@@ -312,6 +347,9 @@ AMSAPI_RENDER_ALLURE=1 python main.py --report allure
 | `WRITE_BACK` | `false` | 是否回写数据源。**CI 建议保持 false** |
 | `TIMEOUT` | `30` | 请求超时（秒） |
 | `DATA_SOURCE` | `excel` | 用例数据源 |
+| `COVERAGE_MIN` | `80` | 框架自测覆盖率下限（%）。低于即构建失败，防止「改了框架不补单测」 |
+| `RETRIES` | `0` | 失败重试次数（需 `pytest-rerunfailures`）。网络抖动环境建议 `1` |
+| `PARALLEL` | `1` | 并行进程数（需 `pytest-xdist`）。`1` = 串行 |
 
 > `WRITE_BACK=false` 的原因：CI 里回写会改动仓库中的 `api_tables.xlsx`，
 > 可能造成工作区脏、并发构建冲突。结果看 Allure 报告即可。
@@ -326,6 +364,17 @@ AMSAPI_RENDER_ALLURE=1 python main.py --report allure
 （步骤树、请求/响应附件、环境信息）。
 
 同时归档了 `log/*.log`，可在构建页 **Artifacts** 中下载排查。
+
+> **日志体积受控**：单文件超过 `[log] max_bytes`（默认 20MB）自动轮转为 `.1` / `.2`，
+> 最多保留 `backup_count`（默认 5）份；启动时按 `keep_days` 清理更早的按天日志。
+> CI 机器上可以把 `keep_days` 设小（如 `3`）以免工作区越跑越满：
+>
+> ```bash
+> AMSAPI_LOG_MAX_BYTES=10485760 AMSAPI_LOG_BACKUP_COUNT=3 AMSAPI_LOG_KEEP_DAYS=3 \
+> python main.py --smoke --report allure
+> ```
+>
+> 注意：`log/*.log` 已脱敏，但仍是**包含业务报文**的制品 —— 对外共享前确认脱敏为开启状态。
 
 ### 5.5 与部署流水线联动（构建后自动冒烟）
 
@@ -411,7 +460,7 @@ variables:
   AMSAPI_TIMEOUT: "30"
   AMSAPI_REPORT_TYPE_EXTRA: ""      # 占位，避免空值告警
 
-# 框架单元测试：离线自检，任何变更都先跑（约 5 秒）
+# 框架单元测试：离线自检，任何变更都先跑（约 10 秒）
 unit-test:
   stage: unit
   image: python:3.10
@@ -556,6 +605,17 @@ jobs:
 3. **冒烟 Job 要设超时保护**
    Jenkinsfile 已设 `timeout(time: 60, unit: 'MINUTES')`，防止网络异常导致构建挂死。
 
+**另外四条企业级建议**：
+
+4. **保持脱敏开启**（`AMSAPI_MASK_SENSITIVE=true`）
+   日志与 Allure 结果会作为制品归档、转发；对外共享时用 `AMSAPI_MASK_MODE=full`。
+5. **保持代理自动绕过**（`AMSAPI_AUTO_BYPASS_PROXY=true`）
+   CI 机器多配「出公网」代理，访问内网会报 502；其余主机用 `AMSAPI_BYPASS_HOSTS` 补。
+6. **把 flake8 与 preflight 作为前置门禁**
+   已在 `Jenkinsfile` 的 `静态检查` / `环境预检` 两个 stage 落地；其它平台照抄命令即可。
+7. **开启依赖漏洞扫描（可选）**
+   `pip install pip-audit && pip-audit -r requirements.txt`，作为独立 stage 定期跑，不阻断主线。
+
 ---
 
 ## 九、故障排查
@@ -571,6 +631,11 @@ jobs:
 | 构建成功但实际有失败 | 误把退出码 5（无用例）当成功 | 在流水线中显式判断退出码非 0 即失败（`sh` 步骤默认行为已满足） |
 | 工作区出现 `api_tables.xlsx` 变更 | `write_back` 为 true | 设 `AMSAPI_WRITE_BACK=false` |
 | 并发构建结果相互覆盖 | 多个构建写同一份数据文件 | 已用 `disableConcurrentBuilds()`；另建议 `write_back=false` |
+| **内网接口全部返回 502 / 连接失败** | CI 机器配了「出公网」代理，把内网请求也转发了 | 确认 `AMSAPI_AUTO_BYPASS_PROXY=true`；其它主机加 `AMSAPI_BYPASS_HOSTS`；或临时 `AMSAPI_TRUST_ENV=false` |
+| **报告/日志里看到明文口令或令牌** | 脱敏被关掉（`AMSAPI_MASK_SENSITIVE=false`） | 改回 `true`；已在结果的附件是历史制品，需重跑清理 |
+| 静态检查 / 环境预检 stage 失败 | 代码有 lint 问题 / 环境缺依赖或配置非法 | 本地跑 `python -m flake8 .`、`python tools/preflight.py` 看具体条目 |
+| 覆盖率门槛失败 | 改了框架代码但没补单测 | 补 `tests/` 下的用例，或与负责人确认后临时调低 `COVERAGE_MIN` |
+| 用例通过但「报告里有 teardown 失败」 | 清理接口异常，用例可能带脏数据 | 搜日志 `teardown 失败`；会话收尾会汇总失败用例编号 |
 
 **排查三板斧**：
 
@@ -583,19 +648,31 @@ jobs:
 ## 十、命令速查
 
 ```bash
+# —— 前置门禁（快速失败）——
+python -m flake8 .                                      # 静态检查
+python tools/preflight.py                               # 环境预检（0 错误才继续）
+python tools/preflight.py --strict                      # 警告也当失败（流水线硬门禁）
+python tools/preflight.py --no-target --json            # 跳过连通性 + JSON 输出
+
 # —— 框架单元测试（离线，不依赖被测环境）——
 python -m pytest tests -q                               # 全部框架自测
 python -m pytest tests --cov=api --cov=utils --cov=main # 带覆盖率
+python -m pytest tests -q --cov-fail-under=80           # 覆盖率门槛
 
 # —— 冒烟 ——
 python main.py --smoke                                  # 只跑冒烟用例
 python main.py --smoke --report allure                  # 冒烟 + Allure 报告
 python main.py --smoke -m excel                         # 只跑 Excel 里的冒烟用例
 AMSAPI_TAGS=core python main.py --smoke                 # 自定义冒烟标签
+python main.py --smoke --reruns=1 --reruns-delay=2 -n 4 # 重试 + 并行（需插件）
 
 # —— CI 参数注入 ——
 AMSAPI_ENV=uat AMSAPI_BASE_URL=https://api.example.com \
 AMSAPI_WRITE_BACK=false AMSAPI_TIMEOUT=30 python main.py --smoke --report allure
+
+# —— 企业级默认项（CI 中建议显式保持）——
+AMSAPI_MASK_SENSITIVE=true AMSAPI_MASK_MODE=full python main.py --report allure
+AMSAPI_AUTO_BYPASS_PROXY=true python main.py --smoke
 
 # —— 切换被测系统（系统适配档案）——
 AMSAPI_SYSTEM=mall python main.py --smoke
@@ -622,11 +699,16 @@ python main.py --report allure
 
 | 文件 | 作用 |
 | --- | --- |
-| `Jenkinsfile` | Jenkins 声明式流水线定义（含框架单元测试阶段） |
-| `config/conf.ci.ini` | CI 专用配置参考模板 |
+| `Jenkinsfile` | Jenkins 声明式流水线定义（静态检查 / 环境预检 / 框架单元测试 + 覆盖率门槛） |
+| `.flake8` / `pyproject.toml` | 静态检查与覆盖率配置 |
+| `requirements.txt` / `requirements-dev.txt` | 运行依赖（带上限约束）/ 开发与 CI 依赖 |
+| `tools/preflight.py` | 环境预检（依赖 / 配置 / 数据 / 目录 / 连通性） |
+| `common/mask.py` | 敏感信息脱敏（日志与报告落盘前打码） |
+| `common/metadata.py` | 采集 git 提交 / 构建号 / 依赖版本，写入 Allure「环境」页 |
+| `config/conf.ci.ini` | CI 专用配置参考模板（已清空全部凭据，`[mask] mode=full`） |
 | `config/systems/*.ini` | 系统适配档案（`AMSAPI_SYSTEM` 指向这里，见 [08-系统适配指南](08-系统适配指南.md)） |
 | `main.py` | 入口，负责参数解析、CI 检测、报告渲染 |
 | `config/settings.py` | 环境变量覆盖逻辑（`_load_env`） |
 | `testcase/test_excel_driver.py`、`test_yaml_driver.py` | 冒烟筛选落地处 |
 | `tests/` | 框架单元测试（CI 第一阶段，见 [07-单元测试](07-单元测试.md)） |
-| `testcase/conftest.py` | marker 注册、环境信息写入（含适配档案摘要） |
+| `testcase/conftest.py` | marker 注册、环境信息写入（含适配档案摘要 + 执行元数据） |

@@ -10,6 +10,11 @@ Allure 报告工具层
     step(title)          步骤上下文（未安装 allure 时自动退化为空上下文）
     write_environment    写入报告「环境」页信息
 
+安全说明（重要）：
+    报告会被归档、被转发、被托管到 CI 服务器，因此**写入报告前一律先脱敏** ——
+    口令 / 令牌 / 票据在报告里以打码形式呈现（见 common/mask.py）。
+    只影响「报告里怎么显示」，不影响真实发出的请求内容。
+
 兼容性说明：
     未安装 allure-pytest 时，本模块所有方法自动降级为空操作，
     框架仍可正常运行，不会因为缺少 Allure 而报错。
@@ -18,6 +23,7 @@ import contextlib
 import json
 import os
 
+from common import mask
 from config import settings
 
 try:
@@ -56,20 +62,25 @@ def _to_text(content):
 # 附件
 # ----------------------------------------------------------------------
 def attach_text(name, content):
-    """附加纯文本附件。"""
+    """附加纯文本附件（写入前脱敏）。"""
     if ALLURE_AVAILABLE:
-        allure.attach(_to_text(content), name=name, attachment_type=allure.attachment_type.TEXT)
+        allure.attach(_to_text(mask.mask_payload(content)), name=name,
+                      attachment_type=allure.attachment_type.TEXT)
 
 
 def attach_json(name, content):
-    """附加 JSON 附件（在报告中带语法高亮）。"""
+    """附加 JSON 附件（在报告中带语法高亮；写入前脱敏）。"""
     if ALLURE_AVAILABLE:
-        allure.attach(_to_text(content), name=name, attachment_type=allure.attachment_type.JSON)
+        allure.attach(_to_text(mask.mask_payload(content)), name=name,
+                      attachment_type=allure.attachment_type.JSON)
 
 
 def attach_request(method, url, headers=None, params=None, body=None):
     """
     把一次请求的关键信息附加到报告，便于失败时快速定位。
+
+    请求头里的 Authorization / Cookie、参数与请求体里的口令与令牌
+    会先经脱敏再写入报告。
 
     :param method:  http 方法
     :param url:     完整请求地址
@@ -79,6 +90,10 @@ def attach_request(method, url, headers=None, params=None, body=None):
     """
     if not ALLURE_AVAILABLE:
         return
+
+    headers = mask.mask_payload(headers) if headers else headers
+    params = mask.mask_payload(params) if params else params
+    body = mask.mask_payload(body) if body else body
 
     sections = ["{} {}".format(str(method).upper(), url)]
     if headers:
@@ -93,7 +108,7 @@ def attach_request(method, url, headers=None, params=None, body=None):
 
 def attach_response(response):
     """
-    把统一响应字典附加到报告。
+    把统一响应字典附加到报告（响应体先脱敏）。
 
     :param response: RequestSend.send() 的返回值
     """

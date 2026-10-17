@@ -464,8 +464,8 @@ class TestProfileDrivenRequest:
         api = make_api(make_profile(headers={"X-Client": "amsapi", "App-Code": "demo"}),
                        fake_session)
         api.request("get", "/x", headers={"App-Code": "other"})
-        assert fake_session.last_call["kwargs"]["headers"] == {"X-Client": "amsapi",
-                                                              "App-Code": "other"}
+        expected = {"X-Client": "amsapi", "App-Code": "other"}
+        assert fake_session.last_call["kwargs"]["headers"] == expected
 
     def test_profile_header_name_case_preserved(self, fake_session, capture_attach):
         """请求头名必须保留大小写，否则 X-Auth-Token 之类的头会发错。"""
@@ -626,8 +626,8 @@ class TestAuthInjection:
                                           "cookie_string": "JSESSIONID=abc; tenant=1"}),
                        fake_session)
         api.request("get", "/x")
-        assert fake_session.last_call["kwargs"]["cookies"] == {"JSESSIONID": "abc",
-                                                              "tenant": "1"}
+        expected = {"JSESSIONID": "abc", "tenant": "1"}
+        assert fake_session.last_call["kwargs"]["cookies"] == expected
 
     def test_no_auth_adds_nothing(self, fake_session, capture_attach):
         api = make_api(make_profile(), fake_session)
@@ -1138,8 +1138,7 @@ class TestCaseLifecycle:
         api.run_case({"id": "C1", "url": "/x", "method": "get"})
         assert api._current_case is None
 
-    def test_check_business_disabled_skips_business_assertion(self, fake_session,
-                                                             capture_attach):
+    def test_check_business_disabled_skips_business_assertion(self, fake_session, capture_attach):
         """令牌 / 文件下载 / 健康检查类接口不遵循业务码信封，可关掉业务断言。"""
         fake_session._default = FakeResponse(payload={"access_token": "AT-1"})
         api = make_api(make_profile(response={"style": "code", "success_values": "0"}),
@@ -1271,4 +1270,3 @@ class TestPaginate:
         assert items == [{"id": 1}]
         assert session.calls[0]["kwargs"]["params"] == {"pageNum": 1, "limit": 1}
         assert session.calls[1]["kwargs"]["params"] == {"pageNum": 2, "limit": 1}
-

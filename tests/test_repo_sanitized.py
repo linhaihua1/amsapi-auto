@@ -35,6 +35,8 @@ TEXT_SUFFIX = (".py", ".md", ".ini", ".yaml", ".yml", ".json", ".txt",
 #
 # 注意：关键字刻意用**片段拼接**而不是整串字面量 —— 否则本文件自己就会命中
 # 自己的扫描规则（守卫代码不能成为违规样本）。
+
+
 def _kw(*parts):
     return "".join(parts)
 
@@ -148,3 +150,108 @@ class TestSanitizedConfig:
             if stripped.startswith("password") and "=" in stripped:
                 assert stripped.split("=", 1)[1].strip() == "", \
                     "conf.ini 的 password 不应预置任何值：{}".format(stripped)
+
+
+# ----------------------------------------------------------------------
+# 配置文件全量扫描：堵住「只校验 conf.ini」的盲区
+# ----------------------------------------------------------------------
+# 背景：历史上 config/conf.ci.ini（CI 参考模板）里预置过
+#       `password = <弱口令>`、`web / environment = <真实标识>`，
+#       而旧守卫只读 settings.CONF_FILE（conf.ini），因此**没有任何测试会红**。
+#       模板文件同样随仓库发布，同样会被复制到真实环境，必须一并守住。
+CONFIG_DIR = os.path.join(ROOT, "config")
+
+# 口令类字段名（只对这些字段做「必须为空」的强校验，
+# 避免误伤 client_secret = your_client_secret 这类占位示例）
+PASSWORD_FIELDS = ("password", "passwd", "pwd")
+
+# 明显弱口令（含片段拼接写法，避免本文件自己命中自己的扫描规则）
+WEAK_VALUES = (
+    _kw("123", "456"),
+    _kw("123", "45678"),
+    _kw("111", "111"),
+    _kw("000", "000"),
+    _kw("ad", "min"),
+    _kw("ro", "ot"),
+    _kw("pass", "word"),
+    _kw("change", "me"),
+)
+
+
+def _config_ini_files():
+    """config/ 下所有 ini（含 systems/ 子目录）。"""
+    for base, _dirs, names in os.walk(CONFIG_DIR):
+        for name in names:
+            if name.endswith(".ini"):
+                yield os.path.join(base, name)
+
+
+def _password_lines(path):
+    """返回 [(行号, 字段名, 值)]，即所有口令类字段的赋值行。"""
+    hits = []
+    for number, line in enumerate(open(path, encoding="utf-8").read().splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith((";", "#")):
+            continue
+        if "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip().lower() in PASSWORD_FIELDS:
+            hits.append((number, key.strip(), value.strip()))
+    return hits
+
+
+class TestConfigTemplatesAreSanitized:
+    """随仓库发布的每一份配置都必须「开箱无凭据」。"""
+
+    def test_no_prefilled_password_in_any_ini(self):
+        """
+        config/ 下所有 ini 的口令字段必须留空或用 ${变量} 占位。
+
+        理由：模板文件会被原样复制到真实环境；一旦预置了值，
+        使用者很可能忘记替换，于是真实环境用着仓库里的弱口令。
+        """
+        offenders = []
+        for path in _config_ini_files():
+            for number, key, value in _password_lines(path):
+                if value == "" or value.startswith("${"):
+                    continue
+                offenders.append("{}:{}  {} = {}".format(
+                    _rel(path), number, key, value))
+        assert not offenders, (
+            "以下配置文件预置了口令值，请改为留空或用 ${变量} 占位：\n  "
+            + "\n  ".join(offenders))
+
+    def test_no_weak_password_value(self):
+        """口令字段不得是明显弱口令（弱口令一旦随模板发布，等同于公开凭据）。"""
+        offenders = []
+        for path in _config_ini_files():
+            for number, key, value in _password_lines(path):
+                low = value.lower()
+                if low in WEAK_VALUES or (low.isdigit() and 4 <= len(low) <= 10):
+                    offenders.append("{}:{}  {} = {}".format(
+                        _rel(path), number, key, value))
+        assert not offenders, (
+            "以下配置使用了弱口令：\n  " + "\n  ".join(offenders))
+
+    @pytest.mark.parametrize("filename", ["conf.ini", "conf.ci.ini"])
+    def test_db_connection_entries_are_empty(self, filename):
+        """
+        `[db]` 段的 host / user / database 必须留空。
+
+        本机 / 内网地址属于环境信息，写进仓库会让「换一台机器跑不通」，
+        也不符合仓库自身的开源约束。本地与 CI 都应通过 AMSAPI_DB_* 环境变量注入。
+        """
+        path = os.path.join(CONFIG_DIR, filename)
+        watched = ("host", "user", "database", "web", "environment")
+        offenders = []
+        for number, line in enumerate(open(path, encoding="utf-8").read().splitlines(), 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith((";", "#")) or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            if key.strip().lower() in watched and value.strip():
+                offenders.append("{}:{}  {} = {}".format(
+                    filename, number, key.strip(), value.strip()))
+        assert not offenders, (
+            "以下项不应预置值（请改用 AMSAPI_* 环境变量注入）：\n  " + "\n  ".join(offenders))

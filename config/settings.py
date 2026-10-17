@@ -14,7 +14,9 @@
     RunConfig     运行开关         [env] [run]
     DB_CONFIG     MySQL 连接       [db]
     ReportConfig  报告标题/文件名  [report]
-    LogConfig     日志级别/格式    [log]
+    LogConfig     日志级别/格式/轮转 [log]
+    MaskConfig    敏感信息脱敏      [log] mask_sensitive + [mask]
+    NetworkConfig 代理与网络行为    [network]
     AuthConfig    OAuth2 取令牌    [auth]
     CIConfig      CI 环境判定      [ci]
 
@@ -210,6 +212,15 @@ class LogConfig:
     # logger 根名称
     ROOT_NAME = "amsapi"
 
+    # ---- 日志轮转与保留（企业级长期运行必备，避免磁盘被日志吃满）----
+    # 单个日志文件大小上限（字节）：超过后自动轮转出 .1 / .2 备份；0 = 不限大小
+    # 之所以需要：一次全量回归可能产生上百 MB 日志，单文件既难打开也难归档
+    MAX_BYTES = 20 * 1024 * 1024
+    # 轮转备份个数（.1 / .2 ...），超出后最旧的备份被覆盖
+    BACKUP_COUNT = 5
+    # 历史日志保留天数：启动时清理更早的按天日志；0 = 不清理（默认关闭，避免误删）
+    KEEP_DAYS = 0
+
     @classmethod
     def file_name(cls, when=None):
         """
@@ -260,6 +271,46 @@ class CIConfig:
                        "GITHUB_ACTIONS", "TF_BUILD", "CI")
 
 
+class MaskConfig:
+    """
+    敏感信息脱敏（对应 conf.ini 的 [log] mask_sensitive 与 [mask] 段）。
+
+    背景：框架默认会把请求头 / 参数 / 响应体打进日志与 Allure 报告，
+    其中包含真实口令与会话令牌。企业环境下这些内容会随制品归档、被转发共享，
+    等同于口令外泄，属于合规高危项，因此默认开启脱敏。
+    """
+
+    # 是否开启脱敏（默认开启；仅排查问题时才建议临时关闭）
+    ENABLED = True
+    # 打码模式：partial（保留首尾少量字符，便于判断是不是同一个令牌）| full（全遮蔽）
+    MODE = "partial"
+    # partial 模式下保留的前缀 / 后缀字符数
+    KEEP_PREFIX = 3
+    KEEP_SUFFIX = 2
+    # 追加的敏感字段名（逗号分隔），用于业务自定义字段，如 "mobile,idcard"
+    EXTRA_KEYS = ""
+
+
+class NetworkConfig:
+    """
+    网络行为（对应 conf.ini 的 [network] 段）。
+
+    存在的意义：CI 机器与办公网普遍配置了对外代理（HTTP_PROXY / HTTPS_PROXY），
+    而 requests 默认会尊重这些变量。于是访问内网被测系统
+    （10.x / 192.168.x / 127.0.0.1）的请求会被代理拦截，
+    表现为 502 或莫名其妙的连接失败 —— 报错信息完全指不到根因。
+    这里给出「环回 / 私网地址自动绕过代理」的默认行为。
+    """
+
+    # 是否沿用系统代理设置（HTTP_PROXY / HTTPS_PROXY / NO_PROXY 等）
+    # 置 false 时完全忽略系统代理（requests 的 trust_env=False）
+    TRUST_ENV = True
+    # 目标为环回 / 私网地址时自动绕过代理（默认开启）
+    AUTO_BYPASS_PROXY = True
+    # 额外指定不走代理的主机，逗号分隔，支持域名后缀匹配（如 corp.internal,10.）
+    BYPASS_HOSTS = ""
+
+
 def _to_bool(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
@@ -305,6 +356,26 @@ def _load_conf_ini():
         LogConfig.FORMAT = sec.get("format", LogConfig.FORMAT)
         LogConfig.DATE_FORMAT = sec.get("date_format", LogConfig.DATE_FORMAT)
         LogConfig.ROOT_NAME = sec.get("root_name", LogConfig.ROOT_NAME).strip() or LogConfig.ROOT_NAME
+        # 日志轮转与保留（上限 0 表示不限大小；保留天数 0 表示不清理历史日志）
+        LogConfig.MAX_BYTES = int(sec.get("max_bytes", LogConfig.MAX_BYTES))
+        LogConfig.BACKUP_COUNT = int(sec.get("backup_count", LogConfig.BACKUP_COUNT))
+        LogConfig.KEEP_DAYS = int(sec.get("keep_days", LogConfig.KEEP_DAYS))
+        # 敏感信息脱敏：与 [log] 段同放，因为它约束的正是「日志怎么写」
+        MaskConfig.ENABLED = _to_bool(sec.get("mask_sensitive", MaskConfig.ENABLED))
+
+    if cf.has_section("mask"):
+        sec = cf["mask"]
+        MaskConfig.MODE = sec.get("mode", MaskConfig.MODE).strip().lower() or MaskConfig.MODE
+        MaskConfig.KEEP_PREFIX = int(sec.get("keep_prefix", MaskConfig.KEEP_PREFIX))
+        MaskConfig.KEEP_SUFFIX = int(sec.get("keep_suffix", MaskConfig.KEEP_SUFFIX))
+        MaskConfig.EXTRA_KEYS = sec.get("extra_keys", MaskConfig.EXTRA_KEYS)
+
+    if cf.has_section("network"):
+        sec = cf["network"]
+        NetworkConfig.TRUST_ENV = _to_bool(sec.get("trust_env", NetworkConfig.TRUST_ENV))
+        NetworkConfig.AUTO_BYPASS_PROXY = _to_bool(
+            sec.get("auto_bypass_proxy", NetworkConfig.AUTO_BYPASS_PROXY))
+        NetworkConfig.BYPASS_HOSTS = sec.get("bypass_hosts", NetworkConfig.BYPASS_HOSTS)
 
     if cf.has_section("auth"):
         sec = cf["auth"]
@@ -396,6 +467,15 @@ def _load_env():
         ("LOG_LEVEL", LogConfig, "LEVEL", lambda v: v.strip().upper()),
         ("LOG_CONSOLE_LEVEL", LogConfig, "CONSOLE_LEVEL", lambda v: v.strip().upper()),
         ("LOG_ROOT_NAME", LogConfig, "ROOT_NAME", None),
+        ("LOG_MAX_BYTES", LogConfig, "MAX_BYTES", int),
+        ("LOG_BACKUP_COUNT", LogConfig, "BACKUP_COUNT", int),
+        ("LOG_KEEP_DAYS", LogConfig, "KEEP_DAYS", int),
+        ("MASK_SENSITIVE", MaskConfig, "ENABLED", _to_bool),
+        ("MASK_MODE", MaskConfig, "MODE", lambda v: v.strip().lower()),
+        ("MASK_EXTRA_KEYS", MaskConfig, "EXTRA_KEYS", None),
+        ("TRUST_ENV", NetworkConfig, "TRUST_ENV", _to_bool),
+        ("AUTO_BYPASS_PROXY", NetworkConfig, "AUTO_BYPASS_PROXY", _to_bool),
+        ("BYPASS_HOSTS", NetworkConfig, "BYPASS_HOSTS", None),
         ("REPORT_TITLE", ReportConfig, "TITLE", None),
         ("REPORT_PROJECT", ReportConfig, "PROJECT", None),
         ("REPORT_HTML_NAME", ReportConfig, "HTML_NAME", None),

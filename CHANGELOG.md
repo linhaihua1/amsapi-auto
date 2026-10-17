@@ -73,7 +73,7 @@
   「从哪个文件开始看（含 9 步代码阅读顺序与按角色的阅读路线）→ 怎么编写用例（Excel/YAML/MySQL/手写四种方式）
   → 怎么执行用例（命令、筛选、报告、日志、退出码）→ 怎么接入 Jenkins（三步接入 + Jenkinsfile 阶段解读 +
   构建参数 + 部署后自动触发）→ 怎么接入 CI/CD 流水线（GitLab CI / GitHub Actions 完整配置）」，
-  另含「新人最容易踩的 8 个坑」「第一天 Checklist」「一页速查卡」；
+  另含「新人最容易踩的 10 个坑」「第一天 Checklist」「一页速查卡」；
   `README.md` 文档导航将其列为**第一入口**
 
 ### 修复（端到端全面功能验证：发现问题就地修复）
@@ -137,6 +137,161 @@
   批次 C 20 项（配置优先级 6 项 / `data_source` 生效 5 项 / 容错提示 3 项 / 协议钩子 2 项 / CI 判定 4 项）
 - 离线端到端 6 条链路全 PASS（默认档案 YAML / Excel、商城、中台、老系统 XML+GBK+签名、冒烟筛选），
   全程用 `AMSAPI_*` 重定向到临时目录，仓库 `data/` 文件**时间戳与大小完全未变**
+
+### 新增（企业级加固：面向企业级自动化测试的 10 项补齐）
+
+一次针对「是否适合企业级自动化测试」的全面体检，发现 10 处不达企业级标准的短板并全部落地修复
+（其中第 10 项是端到端复核阶段才扫出来的漏网路径）：
+
+**1. 敏感信息明文落盘（最高危）→ `common/mask.py` + 三处接入**
+
+- 实测证据：日志与 `report/allure-results/*.txt` 中出现 `password` 明文、
+  `access-ticket: TK-...` 明文、`【关联】ticket = TK-...` 明文。
+  日志与报告会随构建制品归档、被转发，**明文即等同口令外泄**。
+- 新增 `common/mask.py`（275 行）：按**字段名**识别敏感键（`password` / `token` / `ticket` /
+  `authorization` / `secret` / `sign` / `cookie` …），支持驼峰/下划线/中划线拆词，
+  刻意避免 `design` / `tokenizer` 这类误伤；值支持 `partial`（前 3 后 2 + `****`）与 `full` 两种打码；
+  同时处理结构化 dict（`mask_mapping`，递归且**保持结构不变**）与纯文本（`mask_text`，
+  覆盖 `{'k': 'v'}` 的 repr 与 JSON）；内置 `Bearer/Basic/Token <值>` 令牌正则（修掉了
+  「只打码方案名 Bearer、真令牌原样泄漏」的缺陷）。
+- 三处接入：`utils/logutil.py` 的 `SensitiveFilter`（挂在 logger 上，
+  handler 数量不变，既有断言不受影响）、`utils/allureutil.py` 的
+  `attach_text/attach_json/attach_request/attach_response`（**写入前**打码）、
+  `common/variable.py` 的变量池对外展示。
+- 开关与模式配置化：`[log] mask_sensitive`、`[mask] mode / keep_prefix / keep_suffix / extra_keys`。
+
+**2. 内网直连被系统代理拦截 → `utils/requestsutil.py` 自动绕过**
+
+- 实测现象：沙箱注入 `HTTP_PROXY=http://127.0.0.1:52137`，`requests` 默认尊重代理，
+  连 `127.0.0.1:18080` 的 mock 也被转发给代理，报出**指不到根因的 502**
+  （`upstream connect failed: 目标计算机积极拒绝`）。这在 Windows 办公网/CI 机器上普遍存在。
+- 新增 `is_internal_host()` / `host_matches()` / `RequestSend.proxies_for()`：
+  对环回（`localhost` / `127.0.0.1` / `::1`）、私网 A/B/C 类（`10.` / `172.16-31.` / `192.168.`）、
+  `169.254.`、`.local` / `.internal` / `.corp` / `.lan` 等一律 `{"http": None, "https": None}` 绕过。
+- 配置化：`[network] trust_env / auto_bypass_proxy / bypass_hosts`。
+
+**3. 合规守卫存在盲区 → `tests/test_repo_sanitized.py` 扩展**
+
+- 旧版只扫 `settings.CONF_FILE`（即 `conf.ini`），导致 `config/conf.ci.ini` 里的
+  `password = 123456`、`host = 127.0.0.1`、`user = root`、`database = api_test`、
+  `web = gov`、`environment = 139` **完全没被守到**。
+- 现在扫描 `config/**/*.ini` 全部文件：`password` 字段不得有值、不得出现弱口令、
+  `[db]` 的 `host/user/database/web/environment` 必须为空。
+- `config/conf.ci.ini` 同步清空敏感项，并新增 `[log] console_level=INFO` + `[mask] mode=full`
+  （CI 制品对外，用 full 全遮蔽）。
+
+**4. teardown 失败被静默吞掉 → `api/base_api.py` 登记 + 会话收尾汇总**
+
+- 原实现只在 teardown 异常时 `logger.error` 一行，报告里**看不出用例其实是「带脏数据通过」的**。
+- 新增 `TEARDOWN_FAIL_PREFIX` 常量、`BaseApi.teardown_errors` 列表与 `teardown_failed` 属性；
+  失败时登记到 `GlobalVar`（跨用例可查）+ 由 `pytest_sessionfinish` 汇总告警 +
+  三个驱动（excel/yaml/sql）在报告中 attach 痕迹。
+
+**5. 报告无法回答「跑的是哪次提交」→ `common/metadata.py` 写入 Allure 环境页**
+
+- 新增 `git_info()`（`git rev-parse` / `status`，失败安全返回 `{}`）、`ci_info()`
+  （`BUILD_NUMBER` / `GITLAB_CI_PIPELINE_ID` / `GITHUB_RUN_NUMBER` …）、
+  `dependency_versions()`（`importlib.metadata`）、`runtime_info()`，带缓存；
+  键名用中文（`Git 提交` / `构建号` / `运行位置`）直接进 Allure「环境」页，
+  并由 `testcase/conftest.py` 的 `env_info` 注入。
+
+**6. 单文件日志无限增长、历史日志堆积 → 轮转 + 保留策略**
+
+- `utils/logutil.py` 新增 `RotatingFileHandler`（`max_bytes` / `backup_count`）与
+  `_cleanup_old_logs()`（按 `file_name_format` 生成正则，**只删框架自己生成的按天日志**，
+  `keep_days <= 0` 时不删任何文件）。
+- 配置：`[log] max_bytes / backup_count / keep_days`。一次全量回归可能产生上百 MB 日志，
+  单文件既难打开也难归档。
+
+**7. 环境问题伪装成业务失败 → `tools/preflight.py` 环境预检**
+
+- 三档输出（错误 / 警告 / 提示），检查项：Python 版本、依赖（必需 + 可选，缺失给出影响与安装命令）、
+  运行配置、用例数据、可写目录、代理、目标连通性。
+- `--no-target`（跳过连通性）/ `--strict`（警告也非 0 退出）/ `--json`。
+  `pytest.ini` 前置挂到 `main.py` 启动流程。
+
+**8. 依赖无上限、无锁、无静态检查 → 版本约束 + 开发依赖 + lint 配置**
+
+- `requirements.txt` 全部加上限约束（如 `pytest>=7.0,<10`），移除 `pytest-cov`
+  （迁移到 `requirements-dev.txt`）。
+- 新增 `requirements-dev.txt`：flake8 / pytest-cov / xdist / rerunfailures / timeout /
+  jsonschema / cryptography。
+- 新增 `.flake8`（`max-line-length=120`，忽略 E203/W503/E731/E741，排除 legacy/venv）
+  与 `pyproject.toml`（只放 `[tool.coverage.*]`，pytest 配置仍留在 `pytest.ini`）。
+- 端到端跑通 `flake8 .` → **0 问题**（原 14 个：`common/hooks.py` 缩进、
+  `tests/test_api_base_api.py` 3×E128 + W391、`tests/test_utils_allureutil.py` F841、
+  `tests/test_utils_excelutil.py` 未用 import、`tests/test_utils_requestsutil.py` E128、
+  `tools/mock_server.py` 未用 import + E127）。
+
+**9. CI 门禁偏弱 → `Jenkinsfile` 强化**
+
+- 新增 `静态检查`（flake8）与 `环境预检`（`tools/preflight.py`）两个 stage，
+  置于单测之前，快速失败。
+- 新增 `COVERAGE_MIN` / `RETRIES` / `PARALLEL` 构建参数；`pluginArgs()` 辅助函数统一拼装
+  `-n`（xdist 并行）与 `--reruns`（抖动重试）；覆盖率低于门槛即构建失败；归档范围扩展。
+
+**10. 脱敏仍有两条漏网路径（端到端复核时发现）→ 修正则 + 新增落盘后兜底**
+
+前一轮的脱敏只覆盖了「框架自己写出去」的内容，端到端实测仍在制品里扫到明文，
+暴露出两条绕过路径 —— 都已修复：
+
+- **路径 A：URL 查询串里的口令**。
+  `.../login?username=demo_user&password=demo_password` 这类**请求地址**被整体打印时，
+  文本脱敏正则的「值」字符集能吃掉 `&`，于是
+  `username=demo_user&password=demo_password` 被当成一个值挂在**非敏感的 `username`** 名下，
+  真正的口令整条漏过（日志与 Allure 的「响应信息」附件都能看到明文）。
+  修复：`_KV_RE` 的值字符集排除 URL 分隔符 `? & #`（并补 2 条单测锁死该形态）。
+- **路径 B：Allure 插件直接落盘的 `parametrize` 参数**。
+  框架用 `@pytest.mark.parametrize("case", CASES)` 传整条用例数据，
+  Allure 官方 pytest 插件会把**每个参数**自动写成报告参数，于是 `result.json` 里出现
+  `"parameters": [{"name": "case", "value": "{'password': 'demo_password'}"}]`。
+  这条路径由第三方插件直接写文件，不经过框架的 `attach_*`，写入时脱敏无法拦截。
+  修复：新增 `mask.sanitize_file()` / `mask.sanitize_dir()` —— 在
+  `testcase/conftest.py::pytest_sessionfinish` 与 `main.py` 报告渲染完成后，
+  对报告目录做一次**落盘后兜底扫描**（JSON 按结构处理、其余按文本处理，
+  幂等、非目标后缀不动、开关关闭时不动作），把第三方插件与未来新增输出路径一并覆盖。
+- 新增 11 条单测（URL 查询串、`sanitize_file`、`sanitize_dir` 遍历/幂等/关闭开关）。
+
+### 文档（企业级加固全量同步）
+
+`README.md` 与 `docs/00`~`docs/09`、`examples/README.md`、`examples/template/README.md` 全部同步，
+覆盖新增的 `[mask]` / `[network]` 配置段、9 个 `AMSAPI_*` 新变量、`tools/preflight.py`、
+执行元数据、日志轮转、teardown 失败登记、覆盖率门槛与 flake8 门禁：
+
+| 文档 | 本次同步内容 |
+| --- | --- |
+| `README.md` | 目录结构补 `mask.py` / `metadata.py` / `preflight.py` / `.flake8` / `requirements-dev.txt` / `pyproject.toml`；常用命令加 preflight 与 flake8；新增「企业级加固能力」速查表；维护约定补脱敏与静态检查 |
+| `docs/00-新手完整指引.md` | 启动摘要示例补「敏感脱敏」行；「8 个坑」扩为 **10 个坑**（脱敏误认、内网 502）；速查卡补 preflight / flake8 / 两个新环境变量 |
+| `docs/01-新人上手.md` | 3.4 验证环境补 flake8 与 preflight；日志章节补脱敏与轮转；目录速查补新文件 |
+| `docs/02-操作手册.md` | 6.3 报告结构补「执行元数据」与脱敏状态；日志章节补轮转 / 保留 / 兜底脱敏标记 |
+| `docs/03-框架设计.md` | 架构图补两模块；新增 **4.11 企业级加固**（脱敏三处接入、代理绕过、可观测性）；设计决策表与「已知限制」同步 |
+| `docs/04-开发指南.md` | 配置规范补 `[mask]` / `[network]` 与 `MaskConfig` / `NetworkConfig`；提交前自检扩为 6 步；变更影响评估补三类新条目 |
+| `docs/05-常见问题FAQ.md` | 新增第十一节 4 个问答（**Q57–Q60**：代理 502 / 脱敏误认 / teardown 汇总 / preflight）；通用排错流程加「第 0 步 环境预检」 |
+| `docs/06-CICD集成.md` | 报告归档章节补日志轮转与保留策略；相关文件表补 preflight / mask / metadata |
+| `docs/08-系统适配指南.md` | 新增 **4.9 全局配置（不属于档案）**；排查手册补代理 / 脱敏 / teardown 三行；Checklist 加「第 0 步 预检」 |
+| `docs/09-用例编写模板.md` | 自查清单补敏感数据与预检两条；新增「关于敏感数据」小节；错误对照表补三行 |
+| `examples/README.md`、`examples/template/README.md` | 使用步骤补预检；新增「跑完看什么」；补代理绕过与脱敏说明 |
+
+> 环境变量名一律以 `config/settings.py::_load_env` 为准（文档已全仓核对）：
+> `AMSAPI_MASK_SENSITIVE` / `AMSAPI_MASK_MODE` / `AMSAPI_MASK_EXTRA_KEYS` /
+> `AMSAPI_TRUST_ENV` / `AMSAPI_AUTO_BYPASS_PROXY` / `AMSAPI_BYPASS_HOSTS` /
+> `AMSAPI_LOG_MAX_BYTES` / `AMSAPI_LOG_BACKUP_COUNT` / `AMSAPI_LOG_KEEP_DAYS`。
+
+### 验证（企业级加固）
+
+- 框架单元测试：**1118 passed / 16 skipped / 0 failed**（原 978 passed / 15 skipped，
+  新增 `tests/test_common_mask.py` 与 `tests/test_common_metadata.py`）
+- 静态检查：`python -m flake8 .` → **0 问题**
+- 语法检查：`python -m compileall -q api common config utils testcase tools main.py` → 退出码 0
+- 环境预检：`python tools/preflight.py` → 0 错误 / 1 警告（仅可选依赖 jsonschema/cryptography 未装）
+- 内网 mock 端到端：`NO_PROXY` 消除干扰后 7 passed；改用 `proxies_for()` 自动绕过代理后
+  无需 `NO_PROXY` 亦可直连
+- **脱敏端到端实测**：在**保留沙箱代理**（`HTTP_PROXY=http://127.0.0.1:52137`，`NO_PROXY` 为空）
+  的前提下跑 `main.py --report allure`，7 passed；产物（`log/*.log`、`allure-results`、
+  渲染后的 `allure-report`）中 `demo_password` / 真实票据**明文命中数为 0**，
+  仅存 `dem****rd` / `TK-****hr` 形态
+- **文档一致性**：全仓 grep 确认无残留旧统计数字（978 / 993 / 1107 / 1123 / 1133）、
+  无错误的环境变量名（`AMSAPI_MASK_ENABLED` / `AMSAPI_NETWORK_*` 等已全部纠正）
 
 ---
 

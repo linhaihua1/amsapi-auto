@@ -134,7 +134,7 @@ class TestDegrade:
 
     def test_step_works_when_available(self):
         """真实环境下 step 必须可作上下文管理器使用。"""
-        with allureutil.step("步骤") as value:
+        with allureutil.step("步骤"):
             assert True
 
 

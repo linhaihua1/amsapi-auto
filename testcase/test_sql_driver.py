@@ -17,6 +17,7 @@ import pytest
 
 from api.base_api import CaseSkipped
 from config import settings
+from utils import allureutil
 from utils.logutil import logger
 from utils.readmysql import RdTestcase
 
@@ -102,3 +103,8 @@ class TestSqlDriver:
                 with allure.step("结果写入 test_result_record"):
                     if settings.RunConfig.WRITE_BACK:
                         repo.update_results(api_client.res, is_pass, case_id)
+
+                # 后置清理失败时在报告中显式留痕（用例结论不受影响，但可能有脏数据残留）
+                if getattr(api_client, "teardown_failed", False):
+                    allureutil.attach_text("后置清理失败（可能残留脏数据，请人工确认）",
+                                           "\n".join(api_client.teardown_errors))
