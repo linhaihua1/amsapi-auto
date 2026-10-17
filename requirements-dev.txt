@@ -1,0 +1,23 @@
+# 开发 / CI 门禁依赖
+# 安装：pip install -r requirements.txt -r requirements-dev.txt
+#
+# 与 requirements.txt 的分工：
+#     requirements.txt      跑用例、出报告所必需的运行时依赖
+#     requirements-dev.txt  只影响「开发体验」与「CI 门禁」的依赖
+#   —— 生产/执行节点只装前者即可，节点越干净，环境问题越少。
+
+# ---- 代码门禁 ----
+flake8>=6.0,<8                    # 静态检查（CI 第一道门，秒级反馈）
+
+# ---- 单元测试增强 ----
+pytest-cov>=4.0,<8                # 覆盖率统计与门槛（--cov-fail-under）
+pytest-xdist>=3.0,<4              # 并行执行（大规模回归）
+pytest-rerunfailures>=12.0,<17    # 失败重试（网络抖动 / 环境不稳时的兜底）
+pytest-timeout>=2.1,<3            # 单用例超时保护，避免流水线挂死
+
+# ---- 可选增强能力（框架会自动降级，仅在使用对应特性时需要）----
+jsonschema>=4.0,<5                # expects 的 schema 断言
+cryptography>=3.4,<47             # AES 加解密 / RSA 签名钩子
+
+# ---- 依赖安全扫描（CI 可选，建议定期执行而非每次构建）----
+# pip-audit>=2.6

@@ -1,0 +1,37 @@
+# ============================================================================
+# 行尾与二进制约定
+# ----------------------------------------------------------------------------
+# 背景：本工程主要在 Windows 上开发，但会被开源给不同平台的用户使用。
+# 若不统一行尾，一次「在 Linux 上改一个字符」会因 CRLF/LF 差异产生整文件 diff，
+# 让代码评审变成噪声。这里统一为：仓库内一律 LF。
+# ============================================================================
+
+# 默认：自动识别文本文件，并以 LF 存入仓库
+* text=auto eol=lf
+
+# 二进制文件：禁止任何文本转换与行尾处理（否则会损坏文件）
+*.xlsx binary
+*.xls  binary
+*.xlsm binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+
+# 明确按文本处理并统一 LF
+*.py     text eol=lf
+*.md     text eol=lf
+*.ini    text eol=lf
+*.cfg    text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.json   text eol=lf
+*.txt    text eol=lf
+*.toml   text eol=lf
+Jenkinsfile text eol=lf
+
+# Git 在 diff / merge 时使用的驱动
+*.py diff=python

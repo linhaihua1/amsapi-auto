@@ -1,0 +1,30 @@
+# =====================================================================
+# 登录模块示例用例（政务 / 平台风格：status 判定 + 票据参数关联）
+# ---------------------------------------------------------------------
+# 本文件是「离线可跑」的示例，配套 tools/mock_server.py 使用，
+# **不依赖任何真实系统**。完整跑法见 docs/02-操作手册.md 的
+# 「不连内网也能跑通（离线体验）」一节。
+#
+# 演示的能力：
+#   · id             用例编号，供其它用例 depends 引用
+#   · tags           [smoke] 表示参与 CI 冒烟筛选（python main.py --smoke）
+#   · relation       ticket=body.data.ticket —— 提取票据写入全局变量池，
+#                    后续用例写 ${ticket} 即可自动带上，无需写任何代码
+#   · expects        字段级断言（21 种算子，见 docs/04-开发指南.md）
+#   · url 用相对路径  真实域名由 AMSAPI_BASE_URL 或系统档案提供，
+#                    因此同一份用例可在测试 / 预发 / 生产之间切换
+# =====================================================================
+cases:
+  - id: 1001
+    title: 登录并提取票据
+    tags: [ smoke ]
+    url: /v1/users/login
+    method: get
+    headers: { "Content-Type": "application/json" }
+    request_body:
+      username: demo_user
+      password: demo_password
+    # 把响应里的票据提取进变量池；这是「接口间参数关联」的核心配置
+    relation: ticket=body.data.ticket
+    expected_code: 200
+    expects: "type:body.data=dict; not_empty:body.data.ticket"

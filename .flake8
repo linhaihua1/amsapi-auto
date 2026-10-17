@@ -1,0 +1,30 @@
+; flake8 静态检查配置
+; 说明：flake8 不读取 pyproject.toml，因此单独放 .flake8。
+; 定位：CI 的第一道门（秒级反馈），拦「语法级 / 明显笔误级」问题，
+;       不追求风格洁癖 —— 风格类规则一律通过 extend-ignore 明确豁免，
+;       避免把「空格数量」变成流水线失败原因。
+[flake8]
+max-line-length = 120
+; E203  切片冒号前的空格（与 black 冲突，无实际意义）
+; W503  二元运算符换行位置（与 black 冲突）
+; E731  lambda 赋值（本工程在工厂/替身里刻意使用）
+; E741  单字符变量名 l（表意清晰即可）
+extend-ignore = E203, W503, E731, E741
+exclude =
+    .git,
+    __pycache__,
+    venv,
+    .venv,
+    env,
+    legacy,
+    report,
+    log,
+    .idea,
+    .pytest_cache,
+    build,
+    dist
+; 这几个脚本需要在 sys.path 调整之后再 import 项目模块（E402 不适用）
+per-file-ignores =
+    tools/preflight.py: E402
+    tools/mock_server.py: E402
+    tools/generate_report.py: E402

@@ -1,0 +1,34 @@
+# =====================================================================
+# 商城 / 购物风格示例（配合 config/systems/mall.ini + tools/mock_server.py）
+# ---------------------------------------------------------------------
+# 系统差异由档案承担，用例只描述业务：
+#   · response.style = success   -> 成功看 body.success（true/1/yes/ok）
+#   · auth.type = bearer         -> 自动带 Authorization: Bearer <token>
+#   · [hosts] 域名别名           -> 用例可用 user:/v1/x 路由到不同微服务
+#
+# 跑法见 examples/README.md
+# =====================================================================
+cases:
+  - id: 2001
+    title: 查询商品列表（success 判定 + 分页）
+    tags: [ smoke ]
+    url: /v1/goods
+    method: get
+    request_body: { "page": 1, "pageSize": 5 }
+    # 不写 expected_code：档案里 success 风格自带成功值集合，
+    # 由框架直接判定，用例只需关心字段断言
+    expects: "equals:body.success=true; type:body.result.list=list; not_empty:body.result.list"
+
+  - id: 2002
+    title: 下单并自动清理（teardown 演示）
+    url: /v1/orders
+    method: post
+    request_body: { "goodsId": "G0001", "count": 1 }
+    # 提取订单号进变量池，供 teardown 的 ${orderId} 使用
+    relation: orderId=body.result.orderId
+    # 后置清理：断言失败也会执行，避免在对方系统里留下脏数据
+    teardown:
+      - method: post
+        url: /v1/orders/cancel
+        request_body: { "orderId": "${orderId}" }
+    expects: "equals:body.success=true; not_empty:body.result.orderId"

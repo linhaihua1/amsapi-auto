@@ -1,0 +1,41 @@
+# =====================================================================
+# 老系统风格示例（XML 报文 / GBK 编码 / 请求签名）
+# ---------------------------------------------------------------------
+# 这三种能力在档案里是「开关」，也可以直接用环境变量临时打开：
+#   AMSAPI_RESPONSE_FORMAT=xml    -> 响应按 XML 解析（得到 dict）
+#   AMSAPI_ENCODING=gbk           -> 响应按 GBK 解码，中文不乱码
+#   AMSAPI_HOOKS_BEFORE_REQUEST=... -> 请求前自动签名
+#
+# 跑法见 examples/README.md
+#
+# 说明：XML 与 GBK 两个接口的响应里没有统一的业务码字段，
+#       因此关闭业务码断言（check_business: false），只用 expects 做字段级断言。
+# =====================================================================
+cases:
+  - id: 4001
+    title: XML 报文接口（response_format=xml）
+    url: /v1/legacy/xml
+    method: get
+    check_business: false
+    # XML 已被转换为嵌套 dict，路径直接按层级写即可
+    expects: "equals:body.response.status=200; not_empty:body.response.data.item"
+
+  - id: 4002
+    title: GBK 编码响应（encoding=gbk，中文不乱码）
+    url: /v1/legacy/gbk
+    method: get
+    check_business: false
+    expects: "equals:body.message=中文不乱码"
+
+  - id: 4003
+    title: 请求签名（服务端重算并校验）
+    url: /v1/sign/verify
+    method: get
+    request_body:
+      bizId: B-001
+      amount: "100"
+      ts: "1700000000"
+    check_business: false
+    # sign 字段由 AMSAPI_HOOKS_BEFORE_REQUEST 指定的签名钩子自动写入报文，
+    # 服务端用同一算法重算，一致才回 status=200
+    expects: "equals:body.status=200"

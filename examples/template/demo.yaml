@@ -1,0 +1,120 @@
+# =====================================================================
+# YAML 用例编写模板（新手填空版）
+# ---------------------------------------------------------------------
+# 配套：examples/template/README.md、docs/09-用例编写模板.md
+# 本文件**离线可跑**：先起 mock 服务（另开一个终端保持运行）
+#     python tools/mock_server.py
+# 再运行：
+#     AMSAPI_BASE_URL=http://127.0.0.1:18080 \
+#     AMSAPI_CASES_DIR=examples/template \
+#     python main.py -m yaml
+#
+# 换成你自己的接口时，把注释里标了「← 换成你的…」的值改掉即可。
+# 与 Excel 一一对应：Excel 是「列」，这里就是「字段」。
+# =====================================================================
+cases:
+  # -------------------------------------------------------------------
+  # ① 登录取票：最小可用用例
+  #    必填只有 id / title / url / method（YAML 里的用例默认都执行）
+  # -------------------------------------------------------------------
+  - id: 9001
+    title: 登录并提取票据
+    tags: [ smoke ]                     # 进冒烟集（python main.py --smoke 会挑中它）
+    url: /v1/users/login                # ← 换成你的接口路径；写相对路径，域名交给档案/环境变量
+    method: get                         # ← 换成你的方法，小写
+    headers:
+      Content-Type: application/json
+    request_body:                       # GET 会自动挂到 query 参数上，不用区分 params / json
+      username: demo_user               # ← 换成你的账号
+      password: demo_password           # ← 换成你的口令
+    relation: ticket=body.data.ticket   # 提取变量，供后续用例用 ${ticket} 引用
+    expected_code: 200                  # 期望业务码（status / code 风格必填）
+    expects: "type:body.data=dict; not_empty:body.data.ticket"
+
+  # -------------------------------------------------------------------
+  # ② 带依赖 + 参数关联：把上游提取的变量注入请求头
+  # -------------------------------------------------------------------
+  - id: 9002
+    title: 查询权限点（携带登录票据）
+    tags: [ smoke ]
+    url: /admin/resource/authority      # ← 换成你的接口路径
+    method: get
+    headers:
+      Content-Type: application/json
+      access-ticket: ${ticket}          # ← 头名换成你系统的令牌头名；值用 ${变量} 引用
+    request_body: { "appCode": "demo-app", "type": "btn" }
+    depends: 9001                       # 前置未通过 -> 本用例 skip（不是 fail）
+    expected_code: 200
+    expects: "type:body.data=list; not_empty:body.data; elapsed=3000"
+
+  # -------------------------------------------------------------------
+  # ③ 分页与数值断言：演示 gt / 列表下标路径 / elapsed
+  # -------------------------------------------------------------------
+  - id: 9003
+    title: 分页查询组织树
+    url: /admin/org/getTreeRootParentCodePage
+    method: get
+    headers: { "Content-Type": "application/json", "access-ticket": "${ticket}" }
+    request_body:
+      page: 1
+      size: 20
+      code: demo-org
+    depends: 9001
+    expected_code: 200
+    # 路径的根是「完整响应」；列表下标写法：body.rows.0.code
+    expects: "gt:body.total=0; not_empty:body.rows; exists:body.rows.0.code"
+
+  # -------------------------------------------------------------------
+  # ④ 写接口 + 后置清理：演示 relation 与 teardown
+  #    mock 的 /v1/orders 用 success 判定，所以关掉业务码断言
+  # -------------------------------------------------------------------
+  - id: 9004
+    title: 下单并自动清理（teardown 演示）
+    url: /v1/orders                     # ← 换成你的写接口
+    method: post
+    request_body: { "goodsId": "G0001", "count": 1 }
+    relation: orderId=body.result.orderId   # 提取订单号，供 teardown 引用
+    check_business: false               # 业务码非标准成功值时关掉业务码断言
+    teardown:                           # 后置清理：断言失败也会执行
+      - method: post
+        url: /v1/orders/cancel          # ← 换成你的清理接口
+        request_body: { "orderId": "${orderId}" }
+    expects: "not_empty:body.result.orderId"
+
+  # -------------------------------------------------------------------
+  # ⑤ 结构化 expects 写法（可读性更好，与表格简写可混用）
+  # -------------------------------------------------------------------
+  - id: 9005
+    title: 结构化断言示例
+    url: /dicts
+    method: get
+    request_body: { "id": "demo-type", "sysCode": "demo" }
+    expected_code: 200
+    expects:
+      - op: not_empty
+        path: body.rows
+      - op: equals
+        path: body.rows.0.id
+        value: demo-type
+
+  # -------------------------------------------------------------------
+  # ⑥ 前置造数据 + 后置清理：完整「造数据 → 测 → 清理」链路
+  #    setup 支持 relation，提取的变量主请求与 teardown 都能用
+  # -------------------------------------------------------------------
+  - id: 9006
+    title: 前置造数据并清理（setup 演示）
+    url: /dicts                         # ← 换成你要验的主接口
+    method: get
+    request_body: { "id": "demo-type", "sysCode": "demo" }
+    expected_code: 200
+    expects: "not_empty:body.rows"
+    setup:                              # 主请求之前按顺序执行
+      - method: post
+        url: /v1/orders
+        request_body: { "goodsId": "G0009", "count": 1 }
+        relation: seedOrderId=body.result.orderId
+        check_business: false
+    teardown:                           # 主请求 + 断言之后执行，断言失败也会执行
+      - method: post
+        url: /v1/orders/cancel
+        request_body: { "orderId": "${seedOrderId}" }

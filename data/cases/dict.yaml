@@ -1,0 +1,29 @@
+# =====================================================================
+# 字典查询示例用例（无依赖，单独即可执行）
+# ---------------------------------------------------------------------
+# 配套 tools/mock_server.py 使用，离线可跑。
+#
+# 演示的能力：
+#   · GET 请求的 request_body 会自动挂到 query 参数上（框架按 method
+#     与 Content-Type 自动判定，无需在用例里区分 params / json）
+#   · 断言支持列表下标路径，如 body.rows.0.id
+# =====================================================================
+cases:
+  - id: 1004
+    title: 按 id 查询字典
+    tags: [ smoke ]
+    url: /dicts
+    method: get
+    headers: { "Content-Type": "application/json" }
+    request_body: { "id": "demo-type", "sysCode": "demo" }
+    expected_code: 200
+    expects: "not_empty:body.rows; equals:body.rows.0.id=demo-type"
+
+  - id: 1005
+    title: 字典查询-url 直接带参数
+    url: /dicts?id=demo-type
+    method: get
+    headers: { "Content-Type": "application/json" }
+    request_body: { "sysCode": "demo" }
+    expected_code: 200
+    expects: "type:body.total=number"

@@ -1,0 +1,33 @@
+# =====================================================================
+# 数据中台 / 信息系统风格示例（配合 config/systems/dataplatform.ini + tools/mock_server.py）
+# ---------------------------------------------------------------------
+# 系统差异由档案承担，用例只描述业务：
+#   · response.style = code，success_values = 0  -> 成功看 body.code == 0
+#   · auth.type = oauth2   -> 首次请求前自动取令牌，到期前自动续期
+#   · [hosts] api/meta/etl -> 用例写 meta:/v1/xxx 即可换域
+#
+# 跑法见 examples/README.md
+# =====================================================================
+cases:
+  - id: 3001
+    title: 查询数据源列表（code 判定）
+    tags: [ smoke ]
+    url: /api/v1/datasource/list
+    method: get
+    expects: "equals:body.code=0; not_empty:body.data.list"
+
+  - id: 3002
+    title: 触发 ETL 任务
+    url: /api/v1/job/run
+    method: post
+    request_body: { "jobId": "job-demo-001" }
+    expects: "equals:body.code=0; equals:body.data.state=RUNNING"
+
+  - id: 3003
+    title: 参数缺失时返回业务失败码（负向用例）
+    url: /api/v1/job/run
+    method: post
+    request_body: { }
+    # 这条用例故意不给 jobId，演示「业务失败也返回 HTTP 200」时如何断言
+    check_business: false
+    expects: "equals:body.code=1001"

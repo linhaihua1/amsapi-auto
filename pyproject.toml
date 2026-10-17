@@ -1,0 +1,34 @@
+# 工程级工具配置
+# ==============
+# 说明：
+#   · pytest 配置统一放 pytest.ini（内容更直观，且优先级高于本文件，避免两处配置打架）
+#   · flake8 不读取 pyproject.toml，其配置在 .flake8
+#   · 本文件只放覆盖率与工程元信息，CI 直接复用，避免命令行堆一长串参数
+
+[project]
+name = "amsapi-auto"
+version = "1.0.0"
+description = "Python + Requests + pytest 数据驱动接口自动化框架（PO 分层 / 多数据源 / 系统适配 / Allure 报告）"
+requires-python = ">=3.7"
+
+# ---------------------------------------------------------------------------
+# 覆盖率：CI 用 `pytest tests --cov --cov-fail-under=...` 卡住质量门禁
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+# 只统计框架自身代码；用例数据、工具脚本、示例不参与覆盖率
+source = ["api", "common", "config", "utils", "testcase"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# 排除「无法在离线单测中覆盖」的入口与降级分支，避免覆盖率被无意义地拉低
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "except ImportError",
+]
+
+[tool.coverage.html]
+directory = "report/unit-coverage"

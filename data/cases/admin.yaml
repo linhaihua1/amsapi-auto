@@ -1,0 +1,42 @@
+# =====================================================================
+# 管理端示例用例（依赖登录用例提取出的票据）
+# ---------------------------------------------------------------------
+# 配套 tools/mock_server.py 使用，离线可跑。
+#
+# 演示的能力：
+#   · depends        本用例依赖 id=1001（登录）。登录未通过时本用例
+#                    会被「跳过」而不是「失败」——因为前置没成功不代表
+#                    本用例的实现有问题。这是 CI 里最实用的一个开关。
+#   · ${ticket}      请求头里的占位符，每次请求前从变量池实时解析
+#   · expects        数值比较 / 类型断言 / 非空断言
+#   · elapsed        响应耗时断言（性能兜底）
+# =====================================================================
+cases:
+  - id: 1002
+    title: 查询权限点（携带登录票据）
+    tags: [ smoke ]
+    url: /admin/resource/authority
+    method: get
+    headers:
+      Content-Type: application/json
+      access-ticket: ${ticket}
+    request_body: { "appCode": "demo-app", "type": "btn" }
+    depends: 1001
+    expected_code: 200
+    # 断言：data 是列表且非空；整体响应在 3 秒内返回
+    expects: "type:body.data=list; not_empty:body.data; elapsed=3000"
+
+  - id: 1003
+    title: 分页查询组织树
+    url: /admin/org/getTreeRootParentCodePage
+    method: get
+    headers:
+      Content-Type: application/json
+      access-ticket: ${ticket}
+    request_body:
+      page: 1
+      size: 20
+      code: demo-org
+    depends: 1001
+    expected_code: 200
+    expects: "gt:body.total=0; not_empty:body.rows"

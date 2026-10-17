@@ -1,0 +1,32 @@
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# 运行产物：日志与报告（可随时重新生成，不入库）
+log/*.log
+report/allure-results/
+report/allure-report/
+report/assets/
+report/report.html
+report/unit-coverage/
+
+# 覆盖率数据文件
+.coverage
+.coverage.*
+
+# 回归验证临时目录
+_verify/
+
+# 注意：data/ 下的用例数据属于项目资产，必须入库，不要在此忽略

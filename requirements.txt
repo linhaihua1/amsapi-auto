@@ -1,0 +1,36 @@
+# 接口自动化测试框架依赖
+# 安装：pip install -r requirements.txt
+
+# 测试框架与报告
+pytest>=7.0
+pytest-html>=3.1
+allure-pytest>=2.13
+
+# 可选：框架单元测试的覆盖率统计（pytest tests --cov=...）
+pytest-cov>=4.0
+
+# 可选：Allure HTML 报告渲染还需 allure 命令行工具（依赖 Java）
+# 下载：https://github.com/allure-framework/allure2/releases
+# 校验：allure --version
+
+# HTTP 请求
+requests>=2.25
+
+# Excel 数据源读写
+openpyxl>=3.0
+
+# YAML 数据源读写
+PyYAML>=5.4
+
+# MySQL 数据源（data_source = mysql 时需要）
+PyMySQL>=1.0
+
+# ---------------------------------------------------------------------------
+# 以下为「可选增强依赖」：未安装时框架自动降级并给出安装提示，不影响已有功能。
+# 需要时单独安装：
+#     pip install jsonschema cryptography
+# ---------------------------------------------------------------------------
+# 字段级断言中的 schema: 算子（JSON Schema 校验）
+# jsonschema>=4.0
+# AES 加解密 / RSA 签名钩子（政务、财务系统的报文加密常见）
+# cryptography>=3.4
