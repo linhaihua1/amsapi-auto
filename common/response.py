@@ -18,12 +18,17 @@
 
     用例给了 expected_code  -> 用 expected_code 与「实际业务码」比较
     用例没给 expected_code  -> 用 success_values 集合判断实际业务码是否算成功
-    两者都没有              -> 只看 HTTP 状态码
+    两者都没有              -> **报错**（fail-closed），而不是只看 HTTP 状态码
 
-这样既兼容原来的 "expected_code=200 对应 body.status=200"，
-也支持商城/中台这种「成功就是 true / 0，用例不必写期望值」的写法。
+最后一条是刻意收紧的：早期版本在「两者都没有」时退化为「HTTP 200 即成功」，
+而政务 / ERP / 商城系统普遍「业务失败也返回 HTTP 200」，于是漏填 expected_code 的
+用例会**静默变绿**（只在日志里留一行 WARNING，没人会去看）。
+这类假绿比红色失败危险得多 —— 它让「断言根本没跑」看起来像「功能正常」。
+因此现在要求用例显式给出期望值，或由档案配置 success_values；
+确实只需判断 HTTP 状态时，把用例的 `check_business` 置 false（语义明确，可被搜索到）。
 """
 from common import base
+from common.exceptions import CaseDataError
 from utils.logutil import logger
 
 # ----------------------------------------------------------------------
@@ -76,7 +81,7 @@ class ResponseSpec:
     """一个系统的「响应成功判定」规则。"""
 
     def __init__(self, style=STYLE_STATUS, success_path=None, success_values=None,
-                 message_path=None, data_path=None, http_ok=None):
+                 message_path=None, data_path=None, http_ok=None, require_expected=True):
         """
         :param style:          内置风格名（见 STYLES）；不识别时按 status 处理
         :param success_path:   自定义业务码路径，如 "body.code"；给出后覆盖风格的默认候选
@@ -84,6 +89,9 @@ class ResponseSpec:
         :param message_path:   错误消息路径；不给出时按 DEFAULT_MESSAGE_PATHS 兜底
         :param data_path:      业务数据体路径；不给出时按 DEFAULT_DATA_PATHS 兜底
         :param http_ok:        视为成功的 HTTP 状态码集合，默认 {200, 201, 202, 204}
+        :param require_expected:
+            用例没给 expected_code、档案也没配 success_values 时是否报错（默认 True）。
+            置 False 可退回旧行为（只看 HTTP 状态码），仅供存量系统过渡期使用。
         """
         self.style = style if style in STYLES else STYLE_STATUS
         # HTTP 成功码统一转 int（档案里写的是 "200,201" 这样的字符串）
@@ -103,7 +111,9 @@ class ResponseSpec:
                               else DEFAULT_MESSAGE_PATHS)
         self.data_paths = ((str(data_path).strip(),) if data_path else DEFAULT_DATA_PATHS)
 
-        # 「判定规则不完整」只警告一次，避免每条用例刷一行
+        self.require_expected = bool(require_expected)
+        # 非严格模式（require_expected=False）下「判定规则不完整」只警告一次，
+        # 避免每条用例刷一行
         self._warned = False
 
     # ------------------------------------------------------------------
@@ -187,13 +197,18 @@ class ResponseSpec:
             return (response or {}).get("code")
         return self._pick(response, self.code_paths)
 
-    def is_success(self, response, expected=None):
+    def is_success(self, response, expected=None, strict=None):
         """
         判定一次响应是否成功。
 
         :param response: 统一响应字典
         :param expected: 用例给出的期望业务码；为空则用 success_values 判断
+        :param strict:   两者都没有时的处理方式。
+                         None（默认）跟随档案的 require_expected；
+                         True 抛 CaseDataError（fail-closed），False 退回「只看 HTTP 状态码」。
+                         分页抓取这类「框架内部、没有用例上下文」的调用应显式传 False。
         :return: bool
+        :raise CaseDataError: 严格模式下「既无 expected_code 也无 success_values」
         """
         if not response:
             return False
@@ -210,15 +225,34 @@ class ResponseSpec:
         if self.success_values:
             return any(self.equal(actual, value) for value in self.success_values)
 
-        # 都没配 -> 属于配置不完整。
-        # 这里按「HTTP 通过即成功」处理，但只提示一次：静默放过是最危险的结果
-        # （忘了写 expected_code 的用例会悄悄变绿），反复刷屏又会淹没真正的失败信息。
-        if self.style != STYLE_RAW and not self._warned:
+        # raw 风格本来就只判 HTTP 状态码，不存在「判定规则缺失」
+        if self.style == STYLE_RAW:
+            return True
+
+        if strict is None:
+            strict = self.require_expected
+
+        if strict:
+            # fail-closed：宁可红，也不要「断言没跑却全绿」。
+            # 错误信息必须直接给出两种修法，否则使用者只会看到一条莫名的失败。
+            raise CaseDataError(
+                "用例缺少 expected_code，无法判定业务是否成功（风格={}，实际业务码={}）。\n"
+                "  这说明业务断言**根本没有执行**，而不是被测系统有问题。\n"
+                "  修法（二选一）：\n"
+                "    1) 在用例数据里补 expected_code（如 {} 风格填 200）；\n"
+                "    2) 在系统档案 [response] 段配 success_values（如 success_values = 0,200），\n"
+                "       让「成功值集合」成为该系统的统一口径。\n"
+                "  确实只需判断 HTTP 状态码的接口（下载 / 健康检查 / 令牌），\n"
+                "  请把用例的 check_business 置 false —— 这是显式声明，不会被误当成漏写。".format(
+                    self.style, actual, self.style))
+
+        # 非严格模式（档案显式关掉 require_expected）：保留旧行为，但必须留痕
+        if not self._warned:
             self._warned = True
             logger.warning(
                 "响应判定配置不完整：风格 '{}' 既无 expected_code 也无 success_values，"
-                "当前仅按 HTTP 状态码判成功。请在用例里补 expected_code，"
-                "或在系统档案 [response] 段配置 success_values。".format(self.style))
+                "当前按 require_expected=false 仅用 HTTP 状态码判成功。"
+                "建议补 expected_code 或在档案 [response] 配置 success_values。".format(self.style))
         return True
 
     def message(self, response):

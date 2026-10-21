@@ -202,12 +202,51 @@ _KV_RE = re.compile(
 )
 
 # 匹配裸令牌串（Bearer xxx / Basic xxx）
-_TOKEN_RE = re.compile(r"\b(Bearer|Basic|Token)\s+([A-Za-z0-9\-._~+/=]{6,})", re.IGNORECASE)
+# 分隔符单独成组：替换时原样保留空格，否则输出会变成 `Bearerabc****56`，
+# 既难读也无法再被下游按 `Bearer <token>` 解析。
+_TOKEN_RE = re.compile(
+    r"\b(Bearer|Basic|Token)(\s+)([A-Za-z0-9\-._~+/=]{6,})", re.IGNORECASE)
 
 # 认证方案名：它们本身不是秘密，真正的秘密是紧随其后的令牌。
 # 若不单独识别，`Authorization: Bearer xxx` 会被按「Bearer」这个短值打码，
 # 而把真正的令牌原样留在后面 —— 这是最容易漏掉的一种形态。
 _AUTH_SCHEMES = frozenset({"bearer", "basic", "token", "digest", "oauth", "apikey", "api-key"})
+
+# 递归进「值内部还是结构」的最大深度。
+# 场景：Excel 的 request_body 是 JSON 字符串，repr 后变成
+#   `'request_body': '{"password": "xxx"}'`
+# 敏感字段藏在第二层甚至第三层（如 `'payload': '{"user": {"password": "x"}}'`）。
+# 限制深度是为了防止异常输入（超长嵌套）拖慢日志输出。
+_MAX_DEPTH = 4
+
+_OPEN_TO_CLOSE = {"{": "}", "[": "]"}
+
+
+def _balanced_spans(text):
+    """
+    找出文本中**最外层**的成对括号区间（只认 `{}` 与 `[]`），返回 [(start, end)]。
+
+    为什么需要它（这是明文泄漏的真正根因）：
+        Excel 数据源里的 `request_body` 是一段 JSON **字符串**，被 repr 后形如
+            'request_body': '{"username": "demo_user", "password": "demo_password"}'
+        顶层 `_KV_RE` 会把 `'{"username": ...}'` 整体当作 `request_body` 的一个值，
+        而 `request_body` 本身不是敏感词 —— 于是内层的 `password` 再没有机会被检查，
+        明文就这样漏进了 Allure 报告。YAML 的 `request_body` 是 dict（键值对平铺），
+        不触发这个形态，所以问题长期没有被发现。
+        解决办法：值内部如果还是一段结构，就必须继续往里看。
+    """
+    spans = []
+    stack = []
+    for index, char in enumerate(text):
+        if char in _OPEN_TO_CLOSE:
+            stack.append((char, index))
+        elif char in ("}", "]") and stack:
+            opener, start = stack[-1]
+            if _OPEN_TO_CLOSE[opener] == char:
+                stack.pop()
+                if not stack:                    # 栈空 = 这一段是最外层
+                    spans.append((start, index + 1))
+    return spans
 
 
 def _mask_quoted(raw):
@@ -217,7 +256,36 @@ def _mask_quoted(raw):
     return mask_value(raw)
 
 
-def mask_text(text):
+def _mask_children(text, depth):
+    """
+    对文本里每个最外层 `{}` / `[]` 片段的内容递归脱敏，再把结果拼回原位。
+
+    只替换**确实发生变化**的片段，因此对「已打过码」的文本重复调用是幂等的，
+    `sanitize_dir()` 多跑几遍也不会把结果越改越乱。
+    """
+    if depth >= _MAX_DEPTH:
+        return text
+    spans = _balanced_spans(text)
+    if not spans:
+        return text
+
+    pieces = []
+    position = 0
+    for start, end in spans:
+        inner = text[start + 1:end - 1]
+        masked_inner = mask_text(inner, depth + 1)
+        if masked_inner == inner:
+            continue
+        pieces.append(text[position:start + 1])
+        pieces.append(masked_inner)
+        position = end - 1
+    if not pieces:
+        return text
+    pieces.append(text[position:])
+    return "".join(pieces)
+
+
+def mask_text(text, _depth=0):
     """
     对一段已拼装好的文本脱敏。
 
@@ -225,7 +293,14 @@ def mask_text(text):
     这样提前拼好的字符串（甚至是 dict 的 repr），无法再从结构上判定，
     因此必须按 `字段名 = 值` 的形态做文本级替换。
 
-    :param text: 原文本
+    处理顺序（缺一不可）：
+        1. 顶层「字段名: 值」替换 —— 覆盖 `password=xxx`、`{"token": "xxx"}`
+        2. 递归进入每个 `{}` / `[]` 片段 —— 覆盖「值是字符串、结构藏在值里」
+           （Excel 数据源的典型形态，见 `_balanced_spans` 的说明）
+        3. 裸令牌兜底 —— 覆盖 `Bearer xxx` 这种没有字段名的形态
+
+    :param text:   原文本
+    :param _depth: 内部递归深度（外部调用不要传）
     :return: 脱敏后的文本；脱敏关闭时原样返回
     """
     if not enabled():
@@ -247,15 +322,22 @@ def mask_text(text):
         # 让紧随其后的令牌被下面的令牌扫描处理（否则只会把 "Bearer" 打码）
         if raw_value.strip("\"'").lower() in _AUTH_SCHEMES:
             continue
+        # 已经是打过码的值：跳过，避免二次打码把结果改得越来越长
+        if MASK_MIDDLE in raw_value:
+            continue
         pieces.append(text[position:match.start("value")])
         pieces.append(_mask_quoted(raw_value))
         position = match.end("value")
     pieces.append(text[position:])
     masked = "".join(pieces)
 
+    # 第二轮：值内部仍是结构的，继续往里钻（Excel 的 request_body 走这条路）
+    masked = _mask_children(masked, _depth)
+
     # 兜底：裸令牌串（如 Authorization 值被单独打印、URL 里带 token 参数）
     return _TOKEN_RE.sub(
-        lambda m: "{}{}".format(m.group(1), mask_value(m.group(2))), masked)
+        lambda m: "{}{}{}".format(m.group(1), m.group(2), mask_value(m.group(3))),
+        masked)
 
 
 def mask_payload(data):

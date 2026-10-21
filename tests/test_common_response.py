@@ -9,6 +9,7 @@
 import pytest
 
 from common import response as response_module
+from common.exceptions import CaseDataError
 from common.response import ResponseSpec
 
 
@@ -142,13 +143,20 @@ class TestIsSuccess:
         assert spec.is_success(resp({"whatever": 1}, code=200)) is True
         assert spec.is_success(resp({"whatever": 1}, code=500)) is False
 
-    def test_incomplete_config_warns_once_and_passes(self, caplog):
+    def test_incomplete_config_fails_closed(self):
         """
-        既无 expected_code 也无 success_values 属于配置不完整：
-        框架按「HTTP 通过即成功」处理（避免打断已有用例），但必须告警，
-        否则「忘了写期望值的用例」会悄悄变绿。
+        既无 expected_code 也无 success_values 时必须失败。
+
+        旧行为是「HTTP 通过即成功 + 一行 WARNING」，结果是漏填期望值的用例静默变绿：
+        业务实际返回 status=999 也照样通过。这类假绿比红色失败危险得多 ——
+        它让「断言根本没跑」看起来像「功能正常」。验收时实测复现过这一点。
         """
-        spec = ResponseSpec("status")
+        with pytest.raises(CaseDataError, match="expected_code"):
+            ResponseSpec("status").is_success(resp({"status": 999}))
+
+    def test_incomplete_config_passes_when_explicitly_not_required(self):
+        """档案显式 require_expected=false 时退回旧行为，但仍必须留痕（告警一次）。"""
+        spec = ResponseSpec("status", require_expected=False)
         assert spec.is_success(resp({"status": 999})) is True
         spec.is_success(resp({"status": 999}))
         assert spec._warned is True

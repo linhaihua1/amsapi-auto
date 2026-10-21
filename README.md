@@ -282,6 +282,9 @@ timeout = 10                                 ; 请求超时（秒）
 verify = false                               ; 是否校验 https 证书
 smoke = false                                ; 是否只跑冒烟用例（CI/CD 用）
 tags = smoke                                 ; 冒烟标签（对应用例的 tags）
+strict_variable = true                       ; 引用未定义 ${var} 时是否判失败
+                                             ;   true  = 直接失败并指出变量名（建议）
+                                             ;   false = 替换为空串 + 告警（旧行为）
 
 [db]
 host =                                       ; 留空 = 未配置，框架不会去连库

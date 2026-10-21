@@ -186,6 +186,9 @@ class SystemProfile:
             message_path=resp_sec.get("message_path"),
             data_path=resp_sec.get("data_path"),
             http_ok=http_ok or None,
+            # 缺 expected_code 时是否报错（fail-closed）。默认开启；
+            # 存量系统确实无法补齐期望值时，可在档案里写 require_expected = false 过渡。
+            require_expected=base.to_bool(resp_sec.get("require_expected"), True),
         )
 
         # ---------------- 认证与钩子 ----------------

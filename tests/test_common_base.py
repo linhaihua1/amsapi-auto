@@ -10,6 +10,7 @@
 import pytest
 
 from common import base
+from common.exceptions import CaseDataError
 from common.variable import GlobalVar
 
 
@@ -50,9 +51,25 @@ class TestRelace:
         GlobalVar.set("ticket", "T-001")
         assert base.relace("access=${ticket}") == "access=T-001"
 
-    def test_missing_variable_replaced_by_empty(self):
-        """变量池中没有的占位符替换为空串，而不是保留原样（避免脏数据透传到服务端）。"""
-        assert base.relace("${not_exist}") == ""
+    def test_missing_variable_fails_closed(self):
+        """
+        变量池里没有的占位符必须判失败，而不是替换成空串后照常发请求。
+
+        旧行为（空串）会让 URL 变成 /v1/goods/ 这种形态，
+        最终以「业务断言失败」收场 —— 报错指向与真实原因（变量名写错 / 上一步没跑）
+        完全无关，排查成本极高。验收时这一点被记为观察项。
+        """
+        with pytest.raises(CaseDataError, match="not_exist"):
+            base.relace("${not_exist}")
+
+    def test_missing_variable_replaced_by_empty_when_not_strict(self):
+        """存量数据确实允许空值时，显式关闭严格模式后退回旧行为（空串）。"""
+        assert base.relace("${not_exist}", strict=False) == ""
+
+    def test_missing_variable_kept_when_map_branch_not_strict(self):
+        """显式传入替换字典时同样适用严格模式：缺的键要能被发现。"""
+        with pytest.raises(CaseDataError, match="b"):
+            base.relace("${a}-${b}", {"a": "1"})
 
     def test_none_value_becomes_empty(self):
         GlobalVar.set("ticket", None)

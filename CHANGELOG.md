@@ -6,6 +6,79 @@
 
 ## [未发布]
 
+### 修复（功能验收发现的问题）
+
+> 来源：对框架做完整功能验收（1134 条自测 + 18 条端到端链路 + 22 项专项检查 +
+> 6 项异常输入探针 + 浏览器渲染验证）定位到 3 个缺陷与 2 个观察项。以下为修复记录。
+> **其中 2 项会改变存量用例的结论**，已单列为「行为变更」。
+
+#### D1【高危】Excel 数据源的明文口令会漏进 Allure 报告
+
+- **现象**：YAML 链路下报告里的口令是 `dem****rd`；换到 Excel 链路就是 `demo_password` 明文。
+- **根因**：Excel 的 `request_body` 是 JSON **字符串**，repr 之后形如
+  `'request_body': '{"username": "demo_user", "password": "demo_password"}'`。
+  `common/mask.py` 的正则 `'[^']*'` 会把这整段当成 `request_body` 的一个值 ——
+  而 `request_body` 不是敏感词，于是内层的 `password` 再没有机会被检查。
+  YAML 的 `request_body` 是 dict（键值对平铺），不触发该形态，所以问题长期未被发现。
+- **修复**（`common/mask.py`）：
+  - 新增 `_balanced_spans()` / `_mask_children()`：值内部如果仍是 `{}` / `[]` 结构，
+    继续往里下钻脱敏（深度上限 4），并把结果原位拼回
+  - 已含 `****` 的值直接跳过，保证**幂等** —— `sanitize_dir()` 对同一文件会跑多次
+  - 顺带修复既有小缺陷：`Bearer <token>` 打码后空格被吃掉（输出成 `Bearerabc****56`）
+- **验证**：Excel 链路全链路跑完，`report/allure-results` 与 `report/report.html` 均
+  `grep` 不到明文，Allure 中出现 `dem****rd`；新增 9 条单测。
+
+#### D2【中】漏填 `expected_code` 会假绿
+
+- **现象**：`status` 风格用例没写 `expected_code` 时，框架退化为「HTTP 200 即成功」。
+  被测接口业务失败也返回 HTTP 200（mock 下 `body.status = 401`），于是用例被判**通过**，
+  日志里只留一行 WARNING。**断言其实根本没执行，看起来却像功能正常。**
+- **修复**（`common/response.py`）：改为 fail-closed ——
+  用例没给 `expected_code`、档案也没配 `success_values` 时直接判失败，
+  错误信息同时给出三种修法（补期望值 / 配成功值集合 / 置 `check_business: false`）。
+  `raw` 风格不受影响（它本来就只判 HTTP）。分页抓取这类无用例上下文的内部调用
+  显式传 `strict=False`。
+- **逃生舱**：档案 `[response] require_expected = false` 可退回旧行为（仍告警一次），
+  用于存量系统过渡。
+
+#### D3【低】pytest-html 报告里的中文用例名是 `\u767b\u5f55`
+
+- **根因**：pytest 要求 nodeid 是 ASCII 安全，`parametrize(ids=<中文>)` 会被转义成
+  `\u767b\u5f55`；pytest-html 直接把 nodeid 展示出来，报告里就成了转义串。
+- **修复**（新增 `utils/htmlreport.py`）：报告落盘后把数据区的 `\\uXXXX` 还原成真实字符。
+  只还原码点 ≥ 0x80 的字符 —— 还原 `\u0022` / `\u005c` 会破坏 JSON 结构。
+  不改 nodeid 本身，因此 `-k id1001` 这类按编号筛选仍然可用。
+- **时序**：修复动作挂在 `pytest_unconfigure`，而不是 `pytest_sessionfinish` ——
+  pytest-html / allure-pytest 也在 sessionfinish 写文件，同级 hook 顺序取决于插件注册顺序，
+  早一步就会扫到还没生成的文件（D1 的明文残留就有一部分是这个原因）。
+  脱敏同样从 sessionfinish 移到此处。
+
+#### 观察项一并修复
+
+- **引用未定义 `${var}` 静默变空串** → 改为严格模式（`common/base.py`）：
+  未定义变量直接判失败，错误信息列出变量名与当前变量池内容，并提示排查方向
+  （拼写 / 依赖用例是否通过 / setup 是否成功）。`[run] strict_variable = false` 可退回旧行为。
+- **空用例 / 缺 url / 缺 method 报错指向错** → `BaseApi._validate_case()` 在发请求前拦截，
+  直接指出「Excel 哪一列 / YAML 哪个字段」没填。旧行为是在断言阶段以
+  「业务断言失败」或 `int(None)` 的 TypeError 收场。
+
+### 行为变更（升级需知）
+
+| 场景 | 旧行为 | 新行为 | 恢复旧行为的方式 |
+| --- | --- | --- | --- |
+| `status` / `code` 风格未写 `expected_code`，档案也无 `success_values` | 只看 HTTP 状态码，**可能假绿** | 判失败，指出缺 `expected_code` | 档案 `require_expected = false`；或单条用例 `check_business: false` |
+| 用例引用未定义的 `${var}` | 替换为空串后照常发请求 | 判失败，列出变量名 | `[run] strict_variable = false` |
+| `sanitize_dir()` 对同一文件重复执行 | 可能二次打码、越改越长 | 幂等（已打码的值跳过） | — |
+
+迁移检查清单：
+
+1. 跑一遍存量用例，把报 `用例缺少 expected_code` 的用例补上期望值（推荐），
+   或确属「不做业务断言」时改成 `check_business: false`；
+2. 报 `用例引用了未定义变量` 的用例，检查变量名拼写与依赖顺序（`depends` / `relation`）；
+3. 报告表格里的用例名会显示为中文（`\u767b\u5f55` → `登录`），属预期变化。
+
+---
+
 本版本主题：**去硬编码 / 开源合规 / 离线可体验**。
 三类改动：①把散落在代码里的可变数据全部收进配置中心；②删除测试过程产生的真实业务数据；
 ③内置 mock 服务与示例用例，让**没有被测系统、没有内网**的人也能完整跑通框架链路。

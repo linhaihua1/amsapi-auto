@@ -699,6 +699,11 @@ style = success
   # 不写 expected_code
 ```
 
+> 反过来：`status` / `code` 风格**必须**写 `expected_code`，否则会报
+> 「用例缺少 expected_code，无法判定业务是否成功」。这是刻意的 fail-closed ——
+> 这类系统业务失败也常返回 HTTP 200，放过就会变成「断言没跑却全绿」。
+> 确实不做业务断言的接口（令牌 / 下载 / 健康检查）请写 `check_business: false`。
+
 ### Q46 报错 `钩子工厂需要调用后才生效（漏写括号了）`
 
 档案里 `[hooks]` 的声明漏了括号。工厂函数必须**调用后**才是钩子：

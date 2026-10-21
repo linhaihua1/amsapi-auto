@@ -11,7 +11,7 @@ import pytest
 
 from api.base_api import BaseApi, CASE_STATUS_PREFIX
 from common import hooks
-from common.exceptions import CaseSkipped
+from common.exceptions import CaseDataError, CaseSkipped
 from common.profile import SystemProfile
 from common.variable import GlobalVar
 from config import settings
@@ -89,7 +89,14 @@ class TestResolve:
         GlobalVar.set("id", 7)
         assert BaseApi.resolve("id=${id}") == "id=7"
 
-    def test_missing_placeholder_becomes_empty(self):
+    def test_missing_placeholder_fails_closed(self):
+        """引用变量池里没有的占位符必须判失败：否则请求会带空值发出去，报错指向业务而非变量。"""
+        with pytest.raises(CaseDataError, match="nope"):
+            BaseApi.resolve({"h": "${nope}"})
+
+    def test_missing_placeholder_becomes_empty_when_strict_disabled(self, monkeypatch):
+        """存量数据确实允许空值时，可关闭严格模式退回旧行为（替换为空串）。"""
+        monkeypatch.setattr(settings.RunConfig, "STRICT_VARIABLE", False)
         assert BaseApi.resolve({"h": "${nope}"}) == {"h": ""}
 
 
@@ -340,6 +347,7 @@ class TestRunCase:
             "cookies": "{}",
             "request_body": '{"username": "demo_user"}',
             "relation": "ticket=body.data.ticket",
+            "expected_code": 200,
         }
         fake_session._default = FakeResponse(payload={"status": 200,
                                                       "data": {"ticket": "TK"}})
@@ -351,7 +359,7 @@ class TestRunCase:
 
     def test_case_without_body(self, api, fake_session):
         case = {"url": "/v1/x", "method": "get", "headers": "{}", "cookies": "{}",
-                "request_body": None, "relation": "None"}
+                "request_body": None, "relation": "None", "expected_code": 200}
         api.run_case(case)
         assert fake_session.last_call["url"] == "http://host:9050/v1/x"
 
@@ -360,14 +368,40 @@ class TestRunCase:
         GlobalVar.set("ticket", "T-PRE")
         case = {"url": "/admin/x", "method": "get",
                 "headers": '{"access-ticket": "${ticket}"}', "cookies": "{}",
-                "request_body": None, "relation": "None"}
+                "request_body": None, "relation": "None", "expected_code": 200}
         api.run_case(case)
         assert fake_session.last_call["kwargs"]["headers"]["access-ticket"] == "T-PRE"
 
     def test_defaults_when_fields_missing(self, api, fake_session):
-        """用例缺字段时不应抛异常。"""
-        res = api.run_case({"url": "/v1/x", "method": "get"})
+        """非必填字段缺省时按默认值处理，请求仍能正常发出。"""
+        res = api.run_case({"url": "/v1/x", "method": "get", "expected_code": 200})
         assert res["code"] == 200
+
+    def test_missing_expected_code_fails_closed(self, api, fake_session):
+        """
+        漏填 expected_code 必须判失败，而不是「HTTP 200 即通过」。
+
+        这是验收时发现的缺陷：`status` 风格缺期望值时会退化成只看 HTTP 状态码，
+        而多数业务系统「失败也返回 HTTP 200」（如 body.status=401），
+        于是断言根本没跑，用例却是绿的。
+        """
+        with pytest.raises(CaseDataError, match="expected_code"):
+            api.run_case({"url": "/v1/x", "method": "get"})
+
+    @pytest.mark.parametrize("case, keyword", [
+        ({}, "为空"),
+        ({"method": "get"}, "缺少 url"),
+        ({"url": "/v1/x"}, "缺少 method"),
+    ])
+    def test_incomplete_case_reports_clear_error(self, api, case, keyword):
+        """
+        空用例 / 缺 url / 缺 method 应在发请求前给出可定位的错误。
+
+        旧行为是继续往下走，最终以「业务断言失败」或 int(None) 的 TypeError 收场，
+        报错指向与真实原因（字段没填）毫无关系。
+        """
+        with pytest.raises(CaseDataError, match=keyword):
+            api.run_case(case)
 
 
 # ======================================================================
@@ -523,27 +557,30 @@ class TestContentTypeFromProfile:
     def test_profile_content_type_applied(self, fake_session, capture_attach):
         api = make_api(make_profile(env={"content_type": "application/x-www-form-urlencoded"}),
                        fake_session)
-        api.run_case({"url": "/x", "method": "post", "request_body": '{"a": 1}'})
+        api.run_case({"url": "/x", "method": "post", "request_body": '{"a": 1}',
+                      "expected_code": 200})
         assert fake_session.last_call["kwargs"]["data"] == {"a": 1}
 
     def test_case_content_type_overrides_profile(self, fake_session, capture_attach):
         api = make_api(make_profile(env={"content_type": "application/x-www-form-urlencoded"}),
                        fake_session)
         api.run_case({"url": "/x", "method": "post", "request_body": '{"a": 1}',
-                      "content_type": "application/json"})
+                      "content_type": "application/json", "expected_code": 200})
         assert fake_session.last_call["kwargs"]["json"] == {"a": 1}
 
     def test_request_type_column_still_supported(self, fake_session, capture_attach):
         """兼容 Excel 原有的 request_type 列，存量数据不用改。"""
         api = make_api(make_profile(), fake_session)
         api.run_case({"url": "/x", "method": "post", "request_body": '{"a": 1}',
-                      "request_type": "application/x-www-form-urlencoded"})
+                      "request_type": "application/x-www-form-urlencoded",
+                      "expected_code": 200})
         assert fake_session.last_call["kwargs"]["data"] == {"a": 1}
 
     def test_case_headers_content_type_not_overwritten(self, fake_session, capture_attach):
         api = make_api(make_profile(env={"content_type": "application/json"}), fake_session)
         api.run_case({"url": "/x", "method": "post", "request_body": '{"a": 1}',
-                      "headers": '{"Content-Type": "application/x-www-form-urlencoded"}'})
+                      "headers": '{"Content-Type": "application/x-www-form-urlencoded"}',
+                      "expected_code": 200})
         assert fake_session.last_call["kwargs"]["data"] == {"a": 1}
 
 
@@ -744,7 +781,8 @@ class TestHostAliasRouting:
 
     def test_run_case_host_field(self, routed):
         api, session = routed
-        api.run_case({"url": "/v1/orders", "method": "get", "host": "order"})
+        api.run_case({"url": "/v1/orders", "method": "get", "host": "order",
+                      "expected_code": 200})
         assert session.last_call["url"] == "http://order-svc:9002/v1/orders"
 
 
@@ -851,7 +889,8 @@ class TestAfterHooks:
 
         profile.hooks.add_after(decrypt)
         api = make_api(profile, fake_session)
-        api.run_case({"url": "/x", "method": "get", "expects": "equals:body.data=PLAIN"})
+        api.run_case({"url": "/x", "method": "get", "expects": "equals:body.data=PLAIN",
+                      "expected_code": 200})
 
     def test_after_hook_applies_before_extract(self, fake_session, capture_attach):
         """关联提取也应基于解密后的报文，否则提出来的令牌是密文。"""
@@ -864,7 +903,8 @@ class TestAfterHooks:
 
         profile.hooks.add_after(decrypt)
         api = make_api(profile, fake_session)
-        api.run_case({"url": "/x", "method": "get", "relation": "tk=body.data.token"})
+        api.run_case({"url": "/x", "method": "get", "relation": "tk=body.data.token",
+                      "expected_code": 200})
         assert GlobalVar.get("tk") == "TK-REAL"
 
 
@@ -1085,10 +1125,11 @@ class TestCaseLifecycle:
     def test_skipped_case_clears_previous_response(self, fake_session, capture_attach):
         """被 depends 跳过的用例不能把上一条用例的响应留在 res 上（结果回写会串行）。"""
         api = make_api(make_profile(), fake_session)
-        api.run_case({"id": "C1", "url": "/x", "method": "get"})
+        api.run_case({"id": "C1", "url": "/x", "method": "get", "expected_code": 200})
         assert api.res is not None
         with pytest.raises(CaseSkipped):
-            api.run_case({"id": "C2", "url": "/x", "method": "get", "depends": "C404"})
+            api.run_case({"id": "C2", "url": "/x", "method": "get", "depends": "C404",
+                          "expected_code": 200})
         assert api.res is None
 
     def test_depends_failed_case_raises_skipped(self, fake_session, capture_attach):
@@ -1122,7 +1163,7 @@ class TestCaseLifecycle:
 
     def test_run_case_records_pass(self, fake_session, capture_attach):
         api = make_api(make_profile(), fake_session)
-        api.run_case({"id": "C1", "url": "/x", "method": "get"})
+        api.run_case({"id": "C1", "url": "/x", "method": "get", "expected_code": 200})
         assert GlobalVar.get(CASE_STATUS_PREFIX + "C1") == "pass"
 
     def test_run_case_records_fail(self, fake_session, capture_attach):
@@ -1135,7 +1176,7 @@ class TestCaseLifecycle:
     def test_run_case_clears_hook_context_after_run(self, fake_session, capture_attach):
         """用例结束后必须清掉上下文，避免钩子读到上一条用例的数据。"""
         api = make_api(make_profile(), fake_session)
-        api.run_case({"id": "C1", "url": "/x", "method": "get"})
+        api.run_case({"id": "C1", "url": "/x", "method": "get", "expected_code": 200})
         assert api._current_case is None
 
     def test_check_business_disabled_skips_business_assertion(self, fake_session, capture_attach):

@@ -15,6 +15,8 @@ pytest 会自动加载本文件，无需手动 import。职责：
     pytest -m "not network"             # 跳过依赖真实环境的用例
     python main.py --report both        # 同时产出 Allure 与 HTML 报告
 """
+import os
+
 import pytest
 
 from api.base_api import TEARDOWN_FAIL_PREFIX, BaseApi
@@ -22,7 +24,7 @@ from common import mask, metadata
 from common.profile import load_profile
 from common.variable import GlobalVar
 from config import settings
-from utils import allureutil
+from utils import allureutil, htmlreport
 from utils.excelutil import ExcelUtil
 from utils.logutil import logger
 
@@ -135,8 +137,45 @@ def pytest_sessionfinish(session, exitstatus):
     if settings.RunConfig.WRITE_BACK:
         ExcelUtil.flush()
     _warn_teardown_failures()
-    _sanitize_reports()
     logger.info("测试会话结束，exitstatus = {}".format(exitstatus))
+
+
+def pytest_unconfigure(config):
+    """
+    会话完全结束后（所有报告均已落盘）做两项收尾。
+
+    为什么放在 unconfigure 而不是 sessionfinish：
+        pytest-html 与 allure-pytest 也在 `pytest_sessionfinish` 里写文件，
+        同级 hook 的先后顺序取决于插件注册顺序 —— 早一步执行就会扫到「还没写出来的报告」。
+        验收时实测到过这一点：Excel 链路下 Allure 报告里残留明文口令，
+        一部分原因就是脱敏跑在了文件落盘之前。
+        `pytest_unconfigure` 在所有 sessionfinish 之后执行，时机是确定的。
+
+    顺序：先还原中文（可读性），再脱敏（安全性）——
+    脱敏产出的打码值不含 `\\uXXXX`，两者互不影响。
+    """
+    _fix_html_report(config)
+    _sanitize_reports()
+
+
+def _fix_html_report(config):
+    """
+    还原 pytest-html 报告里被转义的中文用例名。
+
+    pytest 会把 nodeid 里的非 ASCII 字符转义成 `\\uXXXX`（nodeid 必须是 ASCII 安全），
+    pytest-html 直接把 nodeid 展示出来，于是报告里是人读不了的转义串。
+    这里只还原数据区，不改 nodeid 本身（`-k id1001` 这类筛选依赖 ASCII 编号）。
+    """
+    html_path = getattr(config.option, "htmlpath", None)
+    if not html_path:
+        return
+    if not os.path.isabs(html_path):
+        html_path = os.path.join(settings.BASE_DIR, str(html_path))
+    try:
+        if htmlreport.fix_report(html_path):
+            logger.info("HTML 报告中文用例名已还原：{}".format(html_path))
+    except Exception as exc:                     # noqa: BLE001 —— 展示层修复不得影响测试结论
+        logger.warning("HTML 报告中文还原失败（不影响用例结论）：{}".format(exc))
 
 
 def _sanitize_reports():

@@ -335,3 +335,81 @@ class TestSanitizeDir:
             assert "demo_password" in path.read_text(encoding="utf-8")
         finally:
             settings.MaskConfig.ENABLED = True
+
+
+# ======================================================================
+# 五、嵌套结构脱敏（验收缺陷 D1 的回归用例）
+# ======================================================================
+class TestNestedStructure:
+    """
+    守护验收时实测到的真实泄漏：
+
+        Excel 数据源的 `request_body` 是一段 JSON **字符串**，repr 之后形如
+            'request_body': '{"username": "demo_user", "password": "demo_password"}'
+        旧实现的正则会把整段引号值当成 `request_body` 的一个值，
+        而 `request_body` 本身不是敏感词 —— 内层的 `password` 再没有机会被检查。
+        YAML 的 `request_body` 是 dict（键值对平铺），不触发这个形态，
+        所以这个问题长期没被发现，只在 Excel 链路泄漏。
+
+    修复方式：值内部如果还是一段结构（`{}` / `[]`），继续往里看（见 mask._mask_children）。
+    """
+
+    def test_json_string_value_is_masked(self):
+        text = ("{'id': 1, 'request_body': '{\"username\": \"demo_user\", "
+                "\"password\": \"demo_password\"}'}")
+        out = mask.mask_text(text)
+        assert "demo_password" not in out
+        assert '"password": "dem****rd"' in out
+
+    def test_three_level_nesting(self):
+        text = "{'a': '{\"user\": {\"password\": \"deep_secret_123\"}}'}"
+        out = mask.mask_text(text)
+        assert "deep_secret_123" not in out
+
+    def test_yaml_style_still_works(self):
+        """回归保护：dict 形态（YAML）原本就能正确处理，不能被改坏。"""
+        out = mask.mask_text("{'request_body': {'password': 'demo_password'}}")
+        assert "demo_password" not in out
+
+    def test_idempotent(self):
+        """重复脱敏不能把值越改越长 —— sanitize_dir 会对同一文件多跑几次。"""
+        text = "{'request_body': '{\"password\": \"demo_password\"}'}"
+        once = mask.mask_text(text)
+        assert mask.mask_text(once) == once
+
+    def test_deep_nesting_does_not_raise(self):
+        """异常输入（超深嵌套）必须止于深度上限，不能拖垮日志输出。"""
+        text = "'x'"
+        for _ in range(mask._MAX_DEPTH + 2):
+            text = "{{'k': {}}}".format(text)
+        assert isinstance(mask.mask_text(text), str)
+
+    def test_bearer_token_keeps_separator(self):
+        """`Authorization: Bearer xxx` 打码后必须保留空格，否则输出无法再被解析。"""
+        out = mask.mask_text("Authorization: Bearer abcdef123456")
+        assert out.startswith("Authorization: Bearer ")
+        assert "abcdef123456" not in out
+
+    def test_non_sensitive_structure_untouched(self):
+        """业务字段里的结构不被打码（过度打码会让报告失去排错价值）。"""
+        text = '{"data": "{\\"total\\": 23, \\"page\\": 1}"}'
+        assert mask.mask_text(text) == text
+
+    def test_sanitize_json_file_with_nested_string(self, tmp_path):
+        """
+        落盘兜底路径（真实泄漏点）：Allure result.json 的 parametrize 参数里，
+        整条用例以字符串形式存在，口令藏在第二层。
+        """
+        import json as _json
+
+        path = tmp_path / "result.json"
+        payload = {
+            "parameters": [{
+                "name": "case",
+                "value": "{'request_body': '{\"password\": \"demo_password\"}'}",
+            }]
+        }
+        path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        assert mask.sanitize_file(str(path)) is True
+        assert "demo_password" not in path.read_text(encoding="utf-8")

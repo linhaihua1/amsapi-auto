@@ -120,6 +120,11 @@ class RunConfig:
     # 冒烟标签：用例 tags 字段命中任意一个即参与冒烟执行
     TAGS = "smoke"
 
+    # 变量严格模式：用例引用了 ${var} 但变量池里没有该变量时是否直接失败。
+    # 默认 True（fail-closed）：变量名拼错、依赖的上一步没执行，都会在发请求前暴露。
+    # 置 False 可退回旧行为（未定义变量替换为空串，照常发请求），仅供存量数据过渡。
+    STRICT_VARIABLE = True
+
 
 def resolve_db_web():
     """MySQL 数据源的 web 标识：优先取 conf.ini，缺省回退 RunConfig.DB_WEB。"""
@@ -331,6 +336,8 @@ def _load_conf_ini():
         RunConfig.VERIFY = _to_bool(sec.get("verify", RunConfig.VERIFY))
         RunConfig.SMOKE_ONLY = _to_bool(sec.get("smoke", RunConfig.SMOKE_ONLY))
         RunConfig.TAGS = sec.get("tags", RunConfig.TAGS)
+        RunConfig.STRICT_VARIABLE = _to_bool(
+            sec.get("strict_variable", RunConfig.STRICT_VARIABLE))
 
     if cf.has_section("env"):
         sec = cf["env"]
@@ -454,6 +461,7 @@ def _load_env():
         ("DB_ENVIRONMENT", "DB_ENVIRONMENT", None),
         ("SMOKE", "SMOKE_ONLY", _to_bool),
         ("TAGS", "TAGS", None),
+        ("STRICT_VARIABLE", "STRICT_VARIABLE", _to_bool),
     ]
     for env_name, attr, cast in run_items:
         raw = _raw(env_name)

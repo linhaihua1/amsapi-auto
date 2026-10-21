@@ -27,7 +27,7 @@ BaseApi 提供 8 项统一能力：
 """
 from common import asserts
 from common import base
-from common.exceptions import CaseSkipped
+from common.exceptions import CaseDataError, CaseSkipped
 from common.profile import load_profile
 from common.variable import GlobalVar
 from utils import allureutil
@@ -48,6 +48,12 @@ def _has_header(headers, name):
     """请求头里是否已存在某个键（大小写不敏感）。"""
     target = str(name).lower()
     return any(str(key).lower() == target for key in (headers or {}))
+
+
+def _case_label(case):
+    """用例的展示名：优先 id，其次 title，两者都没有时用「该用例」。"""
+    label = case.get("id") or case.get("title") if isinstance(case, dict) else None
+    return "用例 {!r} ".format(label) if label else "该用例"
 
 
 class BaseApi:
@@ -619,6 +625,40 @@ class BaseApi:
         )
         return self.res
 
+    @staticmethod
+    def _validate_case(case):
+        """
+        校验用例数据是否「至少能发出一次请求」。
+
+        为什么要在发请求之前拦住：
+            空用例或漏填 url / method 时，若直接往下走，会分别表现为
+            「请求发出去了但业务断言失败」和「int(None) 的 TypeError」，
+            两者都和真实原因（数据写错了）毫无关系。提前用明确的错误信息
+            把问题定位到「哪一列没填」，比让使用者顺着堆栈猜要省事得多。
+
+        :raise CaseDataError: 用例为空、非字典、缺 url 或 method
+        """
+        if not isinstance(case, dict):
+            raise CaseDataError(
+                "用例数据必须是字典，实际为 {}：{!r}。\n"
+                "  请检查数据源读取逻辑，或该行用例是否被错误地写成了字符串。".format(
+                    type(case).__name__, case))
+        if not case:
+            raise CaseDataError(
+                "用例数据为空（{}）。一条可执行用例至少需要 url 与 method 两个字段：\n"
+                "  Excel：在 test_case_list 表对应行填 D 列 url、E 列 method；\n"
+                "  YAML ：在 -- 分隔的用例块里写 url: /xxx 与 method: get。")
+        if not str(case.get("url") or "").strip():
+            raise CaseDataError(
+                "{}缺少 url，无法发出请求。\n"
+                "  Excel：检查 D 列 url；YAML：检查 url: 字段。\n"
+                "  当前用例内容：{!r}".format(_case_label(case), case))
+        if not str(case.get("method") or "").strip():
+            raise CaseDataError(
+                "{}缺少 method（如 get / post），无法发出请求。\n"
+                "  Excel：检查 E 列 method；YAML：检查 method: 字段。\n"
+                "  当前用例内容：{!r}".format(_case_label(case), case))
+
     def run_case(self, case):
         """
         按一条用例数据执行完整生命周期：前置 -> 请求 -> 关联 -> 断言 -> 后置清理。
@@ -648,6 +688,9 @@ class BaseApi:
 
         # 依赖不满足时抛 CaseSkipped，由用例层转成 pytest.skip
         self.check_depends(case)
+
+        # 数据完整性校验（缺 url / method 直接报明确错误，见方法注释）
+        self._validate_case(case)
 
         # 前置步骤：造数据（如商城的商品、ERP 的供应商）
         self.run_steps(case.get("setup"), label="前置")
@@ -711,7 +754,9 @@ class BaseApi:
 
             self.request(method, path, data=payload, headers=headers, host=host, **kwargs)
 
-            if not self.profile.response.is_success(self.res):
+            # 分页是框架内部动作，没有「用例期望码」的上下文，
+            # 因此显式放开 fail-closed 检查：只用档案的成功值集合 / HTTP 状态码判断。
+            if not self.profile.response.is_success(self.res, strict=False):
                 raise AssertionError(
                     "分页抓取第 {} 页失败：{}".format(page, asserts.summary(self.res)))
 

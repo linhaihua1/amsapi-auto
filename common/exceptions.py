@@ -7,11 +7,23 @@
 
     ConfigError   配置/适配档案有问题 —— 属于环境搭建错误，应尽早暴露
     CaseSkipped   用例被主动跳过（如依赖的用例未通过）—— 不应算失败
+    CaseDataError 用例数据本身不完整/不合法 —— 应判失败，但要指明是数据问题
 """
 
 
 class ConfigError(Exception):
     """配置或系统适配档案不合法。"""
+
+
+class CaseDataError(AssertionError):
+    """
+    用例数据不完整或不合法（缺 url、缺 method、缺 expected_code、引用了未定义变量）。
+
+    为什么继承 AssertionError 而不是 Exception：
+        这类问题的表现应当是「用例失败」，而不是「框架崩溃」或（更糟）「用例通过」。
+        pytest 会把 AssertionError 计为 failed，展示形式与断言失败一致，
+        同时错误信息里能直接写明「该改哪一行」，避免把数据问题误判成产品缺陷。
+    """
 
 
 class CaseSkipped(Exception):

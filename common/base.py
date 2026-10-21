@@ -41,22 +41,81 @@ def _dumps(data):
     return data
 
 
-def relace(ori_data, replace_data=None):
+# 已经告警过的未定义变量名：避免同一批数据里每条用例都刷同一行日志
+_WARNED_MISSING_VARS = set()
+
+
+def _missing_variable_message(missing, available):
+    """拼装「引用了未定义变量」的错误信息（严格模式下直接给使用者看）。"""
+    shown = "、".join(sorted(available)[:10]) or "(变量池为空)"
+    more = "" if len(available) <= 10 else " 等 {} 个".format(len(available))
+    return (
+        "用例引用了未定义变量：{}。\n"
+        "  这意味着请求会带着空值发出去（例如 URL 变成 /v1/goods/），"
+        "而失败会以「业务断言不过」的形式出现，掩盖真正的原因。\n"
+        "  排查方向：变量名拼写、依赖的上一步用例是否执行并通过（relation / depends）、"
+        "setup 步骤是否成功。\n"
+        "  当前变量池：{}{}\n"
+        "  若确实允许空值，可在 conf.ini [run] 段设 strict_variable = false，"
+        "或注入 AMSAPI_STRICT_VARIABLE=false 关闭该检查。".format(
+            "、".join(sorted(set(str(name) for name in missing))), shown, more))
+
+
+def _handle_missing_vars(missing, strict):
+    """
+    处理「引用了未定义变量」：严格模式直接判失败，非严格模式告警一次后放行。
+
+    :param missing: 缺失的变量名列表
+    :param strict:  None = 读配置；True = 判失败；False = 告警放行
+    """
+    from common.exceptions import CaseDataError              # 延迟导入，避免循环依赖
+
+    if strict is None:
+        from config import settings
+        strict = bool(getattr(settings.RunConfig, "STRICT_VARIABLE", True))
+
+    if strict:
+        raise CaseDataError(_missing_variable_message(missing, GlobalVar.all()))
+
+    fresh = sorted({str(name) for name in missing} - _WARNED_MISSING_VARS)
+    if fresh:
+        _WARNED_MISSING_VARS.update(fresh)
+        from utils.logutil import logger
+        logger.warning("引用了未定义变量 {}，已按空串替换（strict_variable=false）".format(
+            "、".join(fresh)))
+
+
+def relace(ori_data, replace_data=None, strict=None):
     """
     将 ori_data 中的 ${var} 用 replace_data 或全局变量池中的值替换。
 
     :param ori_data:     原始数据（dict / list / str）
     :param replace_data: 替换字典；不传则自动从 GlobalVar 取值
+    :param strict:       未定义变量是否判失败。
+                         None（默认）跟随 conf.ini 的 [run] strict_variable（默认开启）。
+                         严格模式下的行为变化是刻意的：旧实现把未定义变量替换成空串后
+                         照常发请求，URL 会变成 `/v1/goods/` 这种形态，最后以
+                         「业务断言失败」收场 —— 报错指向与真实原因（变量名写错 /
+                         上一步没跑）完全无关，排查成本极高。
     :return: 替换后的字符串（dict/list 输入时为 JSON 字符串）
+    :raise CaseDataError: 严格模式下引用了未定义变量
     """
     ori_str = _dumps(ori_data)
 
+    names = find(ori_str) or []
     if replace_data is None:
-        names = find(ori_str) or []
-        replace_data = {name: GlobalVar.get(name, "") for name in names}
+        resolved = {name: GlobalVar.get(name, "") for name in names if GlobalVar.has(name)}
+    else:
+        resolved = dict(replace_data)
+
+    missing = [name for name in names if name not in resolved]
+    if missing:
+        _handle_missing_vars(missing, strict)
+        for name in missing:                     # 非严格模式：退回旧行为（空串）
+            resolved[name] = ""
 
     # 值统一转 str，避免 Template 处理非字符串时报错
-    safe_map = {str(k): "" if v is None else str(v) for k, v in replace_data.items()}
+    safe_map = {str(k): "" if v is None else str(v) for k, v in resolved.items()}
     return Template(ori_str).safe_substitute(safe_map)
 
 

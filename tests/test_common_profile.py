@@ -279,6 +279,20 @@ http_ok = 200
         write_ini(systems_dir, "demo", "[system]\nname = x\n")
         assert load_profile("demo").response.style == "status"
 
+    def test_require_expected_defaults_to_true(self, systems_dir):
+        """默认 fail-closed：缺 expected_code 时必须报错，而不是「HTTP 200 即通过」。"""
+        write_ini(systems_dir, "demo", "[system]\nname = x\n")
+        assert load_profile("demo").response.require_expected is True
+
+    def test_require_expected_can_be_disabled(self, systems_dir):
+        """存量系统确实无法补齐期望值时，档案里可显式关掉（有据可查，不是静默默认）。"""
+        write_ini(systems_dir, "demo", """
+[response]
+style = status
+require_expected = false
+""")
+        assert load_profile("demo").response.require_expected is False
+
 
 class TestAuthSection:
     def test_bearer(self, systems_dir):
