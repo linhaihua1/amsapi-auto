@@ -165,8 +165,16 @@ def mask_mapping(data):
     """
     递归地对比对结构（dict / list）打码。
 
-    只处理「字段名敏感」的项，其余原样返回 —— 因此可以直接用于日志与报告，
-    不会改变数据结构（仍是 dict / list，`_to_text()` 的 JSON 缩进展示不受影响）。
+    两条规则同时生效：
+        · 字段名敏感的项 → 整个值打码（password / token / secret ...）
+        · 字段名不敏感的字符串 → 按**文本规则**脱敏
+
+    第二条是必需的：口令经常以「文本形式」藏在非敏感字段的值里，例如
+        {"msg": "认证失败 password=abc123"}
+    只按键名打码会整条漏过去 —— 而这份 dict 会被日志 Filter 与 Allure
+    附件直接落盘，是最典型的明文泄漏形态。
+
+    结构保持 dict / list 不变，因此 _to_text() 的 JSON 缩进展示不受影响。
     脱敏关闭时（[log] mask_sensitive = false）原样返回。
     """
     if not enabled():
@@ -176,11 +184,15 @@ def mask_mapping(data):
         for key, value in data.items():
             if is_sensitive_key(key):
                 masked[key] = mask_value(value)
+            elif isinstance(value, str):
+                masked[key] = mask_text(value)
             else:
                 masked[key] = mask_mapping(value)
         return masked
     if isinstance(data, (list, tuple)):
         return [mask_mapping(item) for item in data]
+    if isinstance(data, str):
+        return mask_text(data)
     return data
 
 

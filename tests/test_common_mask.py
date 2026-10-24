@@ -117,6 +117,23 @@ class TestMaskMapping:
         assert mask.mask_mapping(5) == 5
         assert mask.mask_mapping(None) is None
 
+    def test_text_form_secret_in_non_sensitive_key(self):
+        """
+        口令以「文本形式」藏在非敏感字段名下时同样要打码。
+
+        真实形态：接口把登录失败原因写在 message 里 ——
+        `{"msg": "认证失败 password=abc123"}`，键名 msg 不敏感，
+        但值里的口令是明文。只按「键名敏感」打码会整条漏过去，
+        而这份 dict 会被日志 Filter 与 Allure 附件直接落盘。
+        """
+        out = mask.mask_mapping({"msg": "认证失败 password=abc123"})
+        assert "abc123" not in out["msg"]
+        assert "msg" in out                              # 键名与结构不变
+
+    def test_text_form_secret_in_nested_list(self):
+        out = mask.mask_mapping({"rows": [{"note": "token=abcdefg"}]})
+        assert "abcdefg" not in out["rows"][0]["note"]
+
 
 # ======================================================================
 # 四、文本脱敏（日志场景）

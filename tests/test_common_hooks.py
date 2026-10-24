@@ -374,3 +374,125 @@ class TestAes:
 
 def test_crypto_available_returns_bool():
     assert isinstance(hooks_module.crypto_available(), bool)
+
+
+# ======================================================================
+# 七、RSA 签名（政务 / 财务系统报文防篡改）
+# ======================================================================
+@crypto
+class TestRsaSign:
+    @staticmethod
+    def _keypair():
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        return private_key, pem
+
+    def test_signature_verifies_with_public_key(self):
+        """签名必须能被对方用公钥验过 —— 这是唯一有意义的正确性判据。"""
+        import base64
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        private_key, pem = self._keypair()
+        text = '{"orderId":"O-1","amount":"100.00"}'
+        signature = hooks_module.rsa_sign(text, pem)
+
+        private_key.public_key().verify(
+            base64.b64decode(signature), text.encode("utf-8"),
+            padding.PKCS1v15(), hashes.SHA256())      # 验签失败会抛 InvalidSignature
+
+    def test_text_and_key_accept_str_or_bytes(self):
+        """配置里私钥常以字符串（含换行）写在 ini 中，不能强制要求 bytes。"""
+        import base64
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        private_key, pem = self._keypair()
+        signature = hooks_module.rsa_sign(12345, pem.decode("ascii"))
+        private_key.public_key().verify(
+            base64.b64decode(signature), b"12345",
+            padding.PKCS1v15(), hashes.SHA256())
+
+    def test_alternate_digest(self):
+        import base64
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        private_key, pem = self._keypair()
+        signature = hooks_module.rsa_sign("x", pem, alg="sha512")
+        private_key.public_key().verify(
+            base64.b64decode(signature), b"x",
+            padding.PKCS1v15(), hashes.SHA512())
+
+    def test_broken_pem_is_reported(self):
+        """私钥写错时必须抛出来，不能返回一个看起来正常的字符串。"""
+        with pytest.raises(Exception):
+            hooks_module.rsa_sign("x", "-----BEGIN PRIVATE KEY-----\nbad\n-----END PRIVATE KEY-----")
+
+
+# ======================================================================
+# 八、响应令牌自动入池（档案里只声明一次登录即可）
+# ======================================================================
+class TestTokenResponseHook:
+    def setup_method(self):
+        from common.variable import GlobalVar
+        self.var = GlobalVar
+        self.var.clear()
+
+    def teardown_method(self):
+        self.var.clear()
+
+    def test_writes_token_into_variable_pool(self):
+        hook = hooks_module.make_token_response_hook("body.result.accessToken", "token")
+        hook({"response": {"body": {"result": {"accessToken": "T-1"}}}})
+        assert self.var.get("token") == "T-1"
+
+    def test_missing_token_leaves_pool_untouched(self):
+        """代码里没取到令牌时不能写入 None —— 那会把入库的有效令牌覆盖成空值。"""
+        self.var.set("token", "OLD")
+        hook = hooks_module.make_token_response_hook("body.result.accessToken", "token")
+        hook({"response": {"body": {"result": {}}}})
+        assert self.var.get("token") == "OLD"
+
+    def test_custom_var_name_and_default_path(self):
+        hook = hooks_module.make_token_response_hook()
+        hook({"response": {"body": {"data": {"token": "T-2"}}}})
+        assert self.var.get("token") == "T-2"
+
+    def test_response_absent_does_not_raise(self):
+        hook = hooks_module.make_token_response_hook("body.data.token", "tk")
+        assert hook({}) == {}
+
+
+# ======================================================================
+# 九、加解密钩子的边界输入
+# ======================================================================
+@crypto
+class TestCryptoHookEdges:
+    KEY = "0123456789abcdef"
+
+    def test_encrypt_hook_ignores_non_dict_payload(self):
+        """payload 不是字典（form 字符串 / 原始字节）时不该炸，原样传递。"""
+        context = {"method": "POST", "url": "http://x", "headers": {},
+                   "cookies": {}, "payload": "a=1&b=2", "location": "data"}
+        assert make_aes_hook(self.KEY)(context)["payload"] == "a=1&b=2"
+
+    def test_encrypt_hook_skips_absent_field(self):
+        """字段名写错时不要凭空造一个空字段，否则对方收到的报文结构就变了。"""
+        outcome = make_aes_hook(self.KEY, fields=("data",))(ctx({"other": 1}))
+        assert outcome["payload"] == {"other": 1}
+
+    def test_decrypt_hook_ignores_non_dict_body(self):
+        hook = make_decrypt_response_hook(self.KEY)
+        assert hook({"response": {"body": "raw text"}})["response"]["body"] == "raw text"
+
+    def test_decrypt_hook_skips_empty_string(self):
+        """空串解不开，也不该被替换成乱码。"""
+        hook = make_decrypt_response_hook(self.KEY, fields=("data",))
+        assert hook({"response": {"body": {"data": ""}}})["response"]["body"]["data"] == ""

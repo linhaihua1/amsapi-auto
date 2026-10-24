@@ -62,13 +62,107 @@
   直接指出「Excel 哪一列 / YAML 哪个字段」没填。旧行为是在断言阶段以
   「业务断言失败」或 `int(None)` 的 TypeError 收场。
 
+### 修复（第 2 轮功能回归：mock 全链路 + 边界探测发现）
+
+> 来源：起 `tools/mock_server.py` 后逐条跑通五套档案（default / mall / dataplatform /
+> legacy(财务) / Excel 链路）+ 参数化边界探测。共定位 5 个缺陷，均先写失败用例再修。
+
+#### D4【高】档案里的 `${token}` 缺变量时，把「用例」判成了失败
+
+- **现象**：按 `examples/README.md` 的命令跑商城示例，2 条用例全红，报
+  `CaseDataError: 用例引用了未定义变量：token`；而 `examples/mall` 本来就没有登录用例，
+  档案里 `[auth] token = ${token}` 也从未入池。加 `AMSAPI_STRICT_VARIABLE=false` 才能跑通。
+- **根因**：`common/auth.py::resolve_credential()` 调用 `base.relace(value)` 时用了默认严格模式，
+  于是 `relace` 先抛异常，紧随其后的「保留原串并告警」分支成了**死代码**。
+  报错层级错位：占位符是**档案**写的，用例一个字都没提这个变量。
+- **修复**：缺失变量时保留原串 + 告警（点名缺哪个变量、提示去查前序登录取票），
+  只在变量齐全时才做替换。`strict_variable` 对用例数据仍然保持 fail-closed，语义不变。
+
+#### D5【中】前置步骤（setup）抛异常时，后置清理一步都不跑
+
+- **现象**：setup 第 1 步已把数据造进对方系统，第 2 步网络抖动失败 —— 异常直接冒出去，
+  `teardown` 完全没执行，脏数据留在被测系统里且无人知晓。
+- **根因**：`run_case()` 里 `run_steps(setup)` 写在 `try` 之外，而清理只在 `finally` 里。
+- **修复**：把 setup 移入 `try`，让 `finally` 的 teardown 覆盖「setup 失败、主请求失败、
+  断言失败」三种路径；同时 setup 失败也会登记用例状态，后续 `depends` 该用例的用例
+  会按「依赖未通过」跳过，而不是「尚未执行」。
+
+#### D6【中】teardown 的响应把用例响应顶掉，Excel 回写记的是清理结果
+
+- **现象**：带 `teardown` 的用例跑完后，Excel `response` 列写的是清理接口的响应
+  （如 `{"cleaned": true}`），而不是被测接口实际返回的内容。
+- **根因**：`run_case()` 的 `return self.res` 在 finally 之前求值，但 `self.res` 属性
+  在 teardown 发请求时又被覆盖；而用例层回写读的正是 `api_client.res`。
+- **修复**：teardown 前后保存 / 还原「用例本身的响应」（清理自身失败时也还原），
+  让 `run_case()` 的返回值与 `api.res` 指向同一份主请求响应。
+
+#### D7【低】档案名拼错 → `INTERNALERROR` 堆栈
+
+- **现象**：`AMSAPI_SYSTEM=malll` 跑出来是 `INTERNALERROR> ... ConfigError`，
+  看着像框架崩了，真实原因只是名字多打了一个字母（退出码 3）。
+- **根因**：档案在 `pytest_sessionstart` 才加载，ConfigError 直接冒成内部错误。
+- **修复**：在 `pytest_configure` 里提前加载并转成 `pytest.UsageError`：
+  输出 `ERROR: 未找到系统适配档案 'xxx'` + 可用档案清单，退出码 4。
+
+#### D8【低】商城档案未声明 `data_path`，`paginate()` 把整包 `result` 当成 1 条数据
+
+- **现象**：`/v1/goods` 有 23 条商品，`api.paginate("/v1/goods", size=5)` 只返回 1 条，
+  且**不报错**（返回的是 `{"list": [...], "total": 23}` 这个字典）。
+- **根因**：`config/systems/mall.ini` 的 `[response]` 没配 `data_path`，
+  `ResponseSpec.data()` 回落到 `body.result` 后拿到字典，`paginate()` 按「非列表数据」
+  包成单元素列表 —— 这是列表接口最典型的假绿。
+- **修复**：档案补 `data_path = body.result.list`（并加注释说明为何必须显式声明）。
+  `paginate()` 的既有契约（非列表数据包成 1 条）保持不变，已有单测锁定。
+
+### 修复（第 3 轮：覆盖率审计发现的漏测与缺陷）
+
+> 来源：以 `coverage run --branch` 审计基线（88%），逐条甄别未覆盖行；同时把
+> 23 条「因缺可选依赖被 skip」的用例在隔离环境装上 `jsonschema` + `cryptography`
+> 跑通（1226 passed / 0 skipped），确认双路径承诺成立。审计中发现 1 个安全缺陷。
+
+#### D9【高危】口令以文本形式藏在非敏感字段里时，脱敏完全失效
+
+- **现象**：
+  - `logger.info({"msg": "认证失败 password=abc123"})` → 日志文件里出现明文 `abc123`
+  - `logger.info("响应 %s", {"msg": "password=abc123"})` → 同上
+  - `mask.mask_payload({"note": "token=abcdefg"})` → 原样返回，未打码
+- **根因**：`common/mask.py::mask_mapping()` 只处理「**键名**敏感」的项
+  （`is_sensitive_key` 命中 password / token / secret ...），其余字符串**原样返回**。
+  于是口令一旦以 `password=xxx` 这种**文本形态**出现在 `msg` / `note` / `remark`
+  这类普通字段里，整条漏过去。而这份 dict 会直接被日志 Filter、Allure 附件、
+  Excel 回写三处落盘 —— 属于 D1 的同类漏洞，只是通道从报告换成了日志文件。
+  未覆盖的 `SensitiveFilter` 的 `record.args` 分支，正是它长期没被发现的原因。
+- **修复**（`common/mask.py`）：`mask_mapping()` 对**非敏感键的字符串值**追加按文本规则
+  脱敏（`mask_text`），list / tuple 里的裸字符串同样处理；敏感键仍走整体打码，
+  结构与键名一律不变（`_to_text()` 的 JSON 展示不受影响）。
+- **性能**：典型 20 行响应体（60 个字符串）单次 `mask_payload` 约 **0.58 ms**，
+  相对一次 HTTP 请求可忽略。
+- **验证**：全链路跑完后 `grep demo_password log/` → **0 命中**，日志中显示为
+  `{'password': 'dem****rd'}`；新增 7 条单测（含 `record.args` 的 tuple / mapping 两种形态）。
+
+#### 补齐的测试缺口（不涉及行为变更）
+
+| 缺口 | 为什么值得补 |
+| --- | --- |
+| PO 层 21 个 `assert_*` 封装全部未覆盖 | 转发错算子（如 `assert_ge` 接到 `gt`）会让断言静默变松/变严，用例照样通过，无任何运行时线索；现用参数化契约测试锁死「方法 → 算子」映射 |
+| `rsa_sign()` / `make_token_response_hook()` 零覆盖 | 档案里明确推荐使用（`mall.ini`、`gov.ini` 都有示例），装 `cryptography` 后从未被验证过；现用真实密钥对验签、并锁定「取不到令牌时不覆盖已入池的值」 |
+| `SensitiveFilter` 的 `args` 分支零覆盖 | 见 D9，这是明文泄漏的最终防线 |
+| `data` / `business_code` / `message` / `elapsed` / `teardown_failed` 属性零覆盖 | 报告与手写用例直接读这些属性 |
+| `_apply_auth()` 的 query 合并三分支 | 认证参数与用例参数抢同一个 query，覆盖顺序错了就是「认证把用例参数顶掉」 |
+| `_as_expects()` 的「坏 JSON 降级」与「空分号跳项」 | Excel 里手写 `expects` 最常见的两种笔误 |
+
 ### 行为变更（升级需知）
 
 | 场景 | 旧行为 | 新行为 | 恢复旧行为的方式 |
 | --- | --- | --- | --- |
 | `status` / `code` 风格未写 `expected_code`，档案也无 `success_values` | 只看 HTTP 状态码，**可能假绿** | 判失败，指出缺 `expected_code` | 档案 `require_expected = false`；或单条用例 `check_business: false` |
 | 用例引用未定义的 `${var}` | 替换为空串后照常发请求 | 判失败，列出变量名 | `[run] strict_variable = false` |
+| 档案 `[auth]` 里的 `${var}` 未入池 | 抛 `用例引用了未定义变量`（指向用例） | 告警 + 保留 `${var}` 原串，由服务端 401 暴露 | 先跑登录取票即可，无需配置 |
+| `setup` 中途失败 | 直接抛出，`teardown` 不执行 | `teardown` 照常执行并登记失败原因 | — |
+| 带 `teardown` 的用例回写 Excel | `response` 列可能记成清理接口的响应 | 始终记被测接口的响应 | — |
+| 档案名拼错 | `INTERNALERROR` 堆栈（退出码 3） | `ERROR: 未找到系统适配档案` + 可用清单（退出码 4） | — |
 | `sanitize_dir()` 对同一文件重复执行 | 可能二次打码、越改越长 | 幂等（已打码的值跳过） | — |
+| 日志 / 附件里「非敏感字段」下的文本口令（如 `{"msg": "password=xxx"}`） | 明文落盘 | 按文本规则打码（`{"msg": "password=****"}`） | `[log] mask_sensitive = false` |
 
 迁移检查清单：
 

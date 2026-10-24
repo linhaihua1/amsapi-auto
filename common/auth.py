@@ -27,6 +27,7 @@ import time
 import requests
 
 from common import base
+from common.variable import GlobalVar
 from config import settings
 from utils.logutil import logger
 
@@ -49,12 +50,21 @@ def resolve_credential(value):
 
     令牌常常是前序接口提取出来的（如登录接口的 ticket），
     因此必须在**每次请求前**解析，而不是构造认证对象时解析一次。
+
+    缺失变量时**保留原串并告警**，不走 base.relace() 的两种默认行为：
+        · 默认（strict=True）会抛「用例引用了未定义变量」—— 但占位符是**档案**写的，
+          用例一个字都没提这个变量，报错层级完全错位（真实原因是「没跑登录取票」）；
+        · strict=False 会替换成空串 —— Authorization 变成 "Bearer "，
+          服务端只会回一个没有上下文的 401。
+    保留 ${token} 原样更利于定位：日志里能直接看出是哪个变量没取到。
     """
     if isinstance(value, str) and "${" in value:
-        resolved = base.relace(value)
-        if "${" in resolved:                     # 变量池里没有，保留原串并提示
-            logger.warning("认证凭证中的变量未解析：{}（请确认前序接口已提取该变量）".format(value))
-        return resolved
+        missing = [name for name in (base.find(value) or []) if not GlobalVar.has(name)]
+        if missing:
+            logger.warning("认证凭证中的变量未解析：{}（缺失 {}，"
+                           "请确认前序接口已提取该变量）".format(value, "、".join(missing)))
+            return value
+        return base.relace(value, strict=False)
     return value
 
 

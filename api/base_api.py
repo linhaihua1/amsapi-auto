@@ -692,12 +692,15 @@ class BaseApi:
         # 数据完整性校验（缺 url / method 直接报明确错误，见方法注释）
         self._validate_case(case)
 
-        # 前置步骤：造数据（如商城的商品、ERP 的供应商）
-        self.run_steps(case.get("setup"), label="前置")
-
+        main_res = None          # 主请求的响应（用例响应）；没发出则保持 None
         is_pass = False
         try:
+            # 前置步骤也放在 try 内：若第 2 步失败，第 1 步造的数据已经落到对方系统里，
+            # 必须让 finally 里的 teardown 照常执行，否则脏数据无人清理、也无人知晓。
+            self.run_steps(case.get("setup"), label="前置")
+
             self._do_request(case)
+            main_res = self.res
             self.extract(case.get("relation") or case.get("extract"))
             self.check_expects(case.get("expects"))
             # 业务成功判定：期望值来自数据的 expected_code，判定风格来自系统档案。
@@ -709,7 +712,7 @@ class BaseApi:
             if base.to_bool(case.get("check_business"), True):
                 self.check_success(case.get("expected_code"))
             is_pass = True
-            return self.res
+            return main_res
         finally:
             self.record_case_status(case, is_pass)
 
@@ -725,6 +728,11 @@ class BaseApi:
                     GlobalVar.set(TEARDOWN_FAIL_PREFIX + str(case_id), str(exc))
                 logger.error("后置清理步骤执行失败（不影响用例结论，但可能残留脏数据）：{}".format(exc))
             finally:
+                # 把「用例本身的响应」放回去：teardown 又发了请求，会把 self.res 换成
+                # 清理接口的响应，而用例层回写结果（Excel 的 response 列）与报告附件
+                # 读的都是 self.res —— 不还原就会记成一段与业务毫无关系的清理响应。
+                # 主请求压根没发出时（setup 失败）保持 None，不留下误导性的半成品。
+                self.res = main_res
                 self._current_case = None
 
     # ==================================================================

@@ -21,6 +21,7 @@ import pytest
 
 from api.base_api import TEARDOWN_FAIL_PREFIX, BaseApi
 from common import mask, metadata
+from common.exceptions import ConfigError
 from common.profile import load_profile
 from common.variable import GlobalVar
 from config import settings
@@ -33,12 +34,20 @@ from utils.logutil import logger
 # 一、会话初始化
 # ----------------------------------------------------------------------
 def pytest_configure(config):
-    """注册 marker，并按配置补全 Allure 结果目录。"""
+    """注册 marker，按配置补全 Allure 结果目录，并提前校验系统适配档案。"""
     config.addinivalue_line("markers", "excel: Excel 数据驱动用例")
     config.addinivalue_line("markers", "yaml: YAML 数据驱动用例")
     config.addinivalue_line("markers", "mysql: MySQL 数据驱动用例")
     config.addinivalue_line("markers", "network: 依赖真实服务环境的用例")
     config.addinivalue_line("markers", "smoke: 冒烟用例（CI/CD 构建后快速验证）")
+
+    # 档案名写错（AMSAPI_SYSTEM / conf.ini [env] system 拼错）在这里就要给出清晰结论：
+    # 留到 sessionstart 才加载，ConfigError 会冒成 `INTERNALERROR> ...` 堆栈，
+    # 看起来像框架崩了，而真实原因只是名字错了一个字母。
+    try:
+        load_profile()
+    except ConfigError as exc:
+        raise pytest.UsageError(str(exc))
 
     # 需要 Allure 报告且命令行未指定 --alluredir 时，补上项目内默认目录
     if settings.RunConfig.REPORT_TYPE in ("allure", "both"):

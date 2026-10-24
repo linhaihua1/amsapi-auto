@@ -409,6 +409,20 @@ class TestShippedProfiles:
     def test_mall_declares_multi_host(self):
         assert "order" in profile_module.load_profile("mall", force=True).hosts
 
+    def test_mall_declares_nested_list_data_path(self):
+        """
+        商城列表在 result.list 下面，档案必须显式声明 data_path。
+
+        不声明时 api.data 拿到的是整个 result 字典，paginate() 会把它当成
+        「1 条数据」静默返回（23 条商品的列表只拿到 1 条）—— 列表接口最典型的假绿：
+        用例不报错，数据却是整包 dict 被当作单条记录。
+        """
+        profile = profile_module.load_profile("mall", force=True)
+        payload = {"code": 200, "body": {"success": True,
+                                         "result": {"list": [{"goodsId": "G1"}],
+                                                    "total": 1}}}
+        assert profile.response.data(payload) == [{"goodsId": "G1"}]
+
 
 def test_systems_dir_constant_points_into_config():
     assert os.path.basename(settings.SYSTEMS_DIR) == "systems"

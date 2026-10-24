@@ -1002,6 +1002,24 @@ class TestExpectsParsing:
         assert BaseApi._as_expects("exists:body.data") == [
             {"op": "exists", "path": "body.data", "value": None}]
 
+    def test_broken_json_falls_back_to_shorthand(self):
+        """
+        以 { / [ 开头但不是合法 JSON 时，退化为简写解析而不是抛异常。
+
+        场景：运营在表格里手写了 `{equals:body.a=1`（少个引号 / 多个花括号），
+        此时整条用例报「expects 格式错误」远比按字面解析更难排查 ——
+        字面解析至少能让断言跑起来，并在失败信息里暴露那个多余的花括号。
+        """
+        assert BaseApi._as_expects("{equals:body.a=1") == [
+            {"op": "{equals", "path": "body.a", "value": "1"}]
+
+    def test_shorthand_skips_blank_chunks(self):
+        """分号连写时空项要跳过，不能产出一条空算子（会撞上"未知算子"报错）。"""
+        assert BaseApi._as_expects("equals:body.a=1;;contains:body.b=2;") == [
+            {"op": "equals", "path": "body.a", "value": "1"},
+            {"op": "contains", "path": "body.b", "value": "2"},
+        ]
+
     def test_structured_dict(self):
         assert BaseApi._as_expects({"op": "gt", "path": "body.n", "value": 3, "msg": "m"}) == [
             {"op": "gt", "path": "body.n", "value": 3, "msg": "m"}]
@@ -1116,6 +1134,49 @@ class TestCaseLifecycle:
         with pytest.raises(AssertionError):
             api.run_case({"url": "/v1/x", "method": "get", "expected_code": 0,
                           "teardown": [{"url": "/v1/x", "method": "delete"}]})
+
+    def test_teardown_runs_when_setup_raises(self, capture_attach):
+        """
+        前置步骤抛异常时也必须执行清理。
+
+        场景：setup 第 1 步已经把数据造进对方系统，第 2 步网络抖动失败。
+        此前 setup 在 try 之外，异常直接冒出去，teardown 一步都没跑 ——
+        造出来的脏数据留在被测系统里，且没有任何人知道（下次构建才莫名失败）。
+        设计文档写的是「造的数据一定要清掉」，因此清理必须包住 setup。
+        """
+        session = FakeSession(responses=[
+            FakeResponse(payload={"code": 0}),          # setup 第 1 步：造数据成功
+            ConnectionError("前置第 2 步网络失败"),
+            FakeResponse(payload={"code": 0}),          # teardown 清理
+        ])
+        api = make_api(self._paging_profile(), session)
+        with pytest.raises(ConnectionError):
+            api.run_case({
+                "id": "C9", "url": "/v1/goods", "method": "get", "expected_code": 0,
+                "setup": [{"url": "/v1/goods", "method": "post"},
+                          {"url": "/v1/goods/boom", "method": "post"}],
+                "teardown": [{"url": "/v1/goods/9", "method": "delete"}],
+            })
+        assert [call["method"] for call in session.calls] == ["post", "post", "delete"]
+
+    def test_teardown_does_not_overwrite_case_response(self, capture_attach):
+        """
+        teardown 的响应不能顶掉用例本身的响应。
+
+        Excel 驱动回写结果时读的是 `api_client.res`；此前 teardown 在 finally 里
+        又发了一次请求，`res` 被换成「清理接口」的响应 —— 于是 Excel 的 response 列
+        记的是清理结果（如 {"cleaned": true}），而不是被测接口到底返回了什么。
+        排查失败用例时会被这条完全无关的响应带偏。
+        """
+        session = FakeSession(responses=[
+            FakeResponse(payload={"code": 0, "data": {"orderId": "O-1"}}),   # 主请求
+            FakeResponse(payload={"code": 0, "cleaned": True}),             # teardown
+        ])
+        api = make_api(self._paging_profile(), session)
+        res = api.run_case({"url": "/v1/orders", "method": "post", "expected_code": 0,
+                            "teardown": [{"url": "/v1/orders/cancel", "method": "post"}]})
+        assert api.res["body"]["data"]["orderId"] == "O-1"
+        assert api.res is res
 
     def test_depends_missing_case_raises_skipped(self, fake_session, capture_attach):
         api = make_api(make_profile(), fake_session)
@@ -1311,3 +1372,175 @@ class TestPaginate:
         assert items == [{"id": 1}]
         assert session.calls[0]["kwargs"]["params"] == {"pageNum": 1, "limit": 1}
         assert session.calls[1]["kwargs"]["params"] == {"pageNum": 2, "limit": 1}
+
+
+# ======================================================================
+# 十一、字段断言封装（PO 层便捷方法，21 个）
+# ----------------------------------------------------------------------
+# 手写用例走的是这些方法，而不是直接调 common.asserts。封装层唯一的职责
+# 就是「转发到正确的算子 + 把最近一次响应作为断言对象」，一旦转发错
+# （例如 assert_ge 接到 gt、assert_in 接到 contains），断言会静默变松或
+# 变严，用例却照样"通过"—— 这类错误没有任何运行时线索，只能靠契约测试兜住。
+# ======================================================================
+ASSERT_SHORTCUTS = [
+    ("assert_equals", "equals", ("body.a", 1)),
+    ("assert_not_equals", "not_equals", ("body.a", 1)),
+    ("assert_contains", "contains", ("body.a", 1)),
+    ("assert_not_contains", "not_contains", ("body.a", 1)),
+    ("assert_startswith", "startswith", ("body.a", "x")),
+    ("assert_endswith", "endswith", ("body.a", "x")),
+    ("assert_regex", "regex", ("body.a", "x")),
+    ("assert_type", "type_is", ("body.a", "str")),
+    ("assert_exists", "exists", ("body.a",)),
+    ("assert_not_exists", "not_exists", ("body.a",)),
+    ("assert_in", "in_", ("body.a", "x,y")),
+    ("assert_not_in", "not_in", ("body.a", "x,y")),
+    ("assert_gt", "gt", ("body.a", 1)),
+    ("assert_ge", "ge", ("body.a", 1)),
+    ("assert_lt", "lt", ("body.a", 1)),
+    ("assert_le", "le", ("body.a", 1)),
+    ("assert_length", "length", ("body.a", 1)),
+    ("assert_empty", "empty", ("body.a",)),
+    ("assert_not_empty", "not_empty", ("body.a",)),
+    ("assert_elapsed", "elapsed", (100,)),
+    ("assert_schema", "schema", ({"type": "object"},)),
+]
+
+
+class TestAssertShortcutForwarding:
+    @pytest.mark.parametrize("method_name, op_func, args", ASSERT_SHORTCUTS,
+                             ids=[item[0] for item in ASSERT_SHORTCUTS])
+    def test_forwards_to_declared_operator(self, monkeypatch, api,
+                                           method_name, op_func, args):
+        from common import asserts
+        seen = []
+        monkeypatch.setattr(asserts, op_func, lambda *a, **k: seen.append(a) or "OK")
+        api.res = {"code": 200, "body": {"a": 1}, "elapsed": 5}
+
+        assert getattr(api, method_name)(*args) == "OK"
+        assert len(seen) == 1, "{} 没有转发到 asserts.{}".format(method_name, op_func)
+        assert seen[0][0] is api.res, "断言对象必须是最近一次响应"
+
+    def test_elapsed_passes_none_path_and_max_ms(self, monkeypatch, api):
+        """耗时断言是唯一一个「不针对具体字段」的算子：path 必须传 None。"""
+        from common import asserts
+        seen = []
+        monkeypatch.setattr(asserts, "elapsed", lambda *a, **k: seen.append(a) or True)
+        api.res = {"elapsed": 12}
+
+        api.assert_elapsed(100)
+        assert seen[0][0] is api.res
+        assert seen[0][1] is None
+        assert seen[0][2] == 100
+
+    def test_schema_shortcut_passes_schema_object(self, monkeypatch, api):
+        from common import asserts
+        seen = []
+        monkeypatch.setattr(asserts, "schema", lambda *a, **k: seen.append(a) or True)
+        api.res = {"body": {"a": 1}}
+
+        api.assert_schema({"type": "object"}, "body")
+        assert seen[0][1] == "body"
+        assert seen[0][2] == {"type": "object"}
+
+    def test_real_assertions_pass_and_fail(self, api):
+        """不替身、走真实算子：确认封装拿到的确实是响应的业务字段。"""
+        api.res = {"code": 200, "body": {"n": 5, "s": "hello"}}
+
+        assert api.assert_ge("body.n", 5) is True
+        assert api.assert_contains("body.s", "ell") is True
+        assert api.assert_type("body.n", "int") is True
+        with pytest.raises(AssertionError):
+            api.assert_lt("body.n", 5)
+        with pytest.raises(AssertionError):
+            api.assert_in("body.s", "x,y")
+
+    def test_assert_op_by_name(self, api):
+        """expects 字段的底层入口：按算子名分派。"""
+        api.res = {"code": 200, "body": {"n": 5}}
+        assert api.assert_op("gt", "body.n", 3) is True
+        with pytest.raises(AssertionError):
+            api.assert_op("gt", "body.n", 9)
+
+
+# ======================================================================
+# 十二、响应便捷属性（对外 API，报告与手写用例常用）
+# ======================================================================
+class TestResponseConvenienceProperties:
+    def test_data_follows_profile_path(self, fake_session, capture_attach):
+        api = make_api(make_profile(response={"style": "code",
+                                              "data_path": "body.payload"}), fake_session)
+        api.res = {"code": 200, "body": {"payload": {"id": 7}}}
+        assert api.data == {"id": 7}
+
+    def test_business_code_uses_success_path(self, fake_session, capture_attach):
+        api = make_api(make_profile(response={"style": "code",
+                                              "success_path": "body.bizCode"}), fake_session)
+        api.res = {"code": 200, "body": {"bizCode": 1001}}
+        assert api.business_code == 1001
+
+    def test_message_returns_empty_when_absent(self, fake_session, capture_attach):
+        api = make_api(make_profile(response={"style": "code",
+                                              "message_path": "body.msg"}), fake_session)
+        api.res = {"code": 200, "body": {"msg": "库存不足"}}
+        assert api.message == "库存不足"
+        api.res = {"code": 200, "body": {}}
+        assert api.message == ""
+
+    def test_elapsed_and_empty_response(self, api):
+        assert api.elapsed is None                 # 还没发过请求
+        api.res = {"elapsed": 0}
+        assert api.elapsed == 0
+        api.res = None
+        assert api.elapsed is None
+
+    def test_teardown_failed_flag(self, api):
+        assert api.teardown_failed is False
+        api.teardown_errors.append("清理接口超时")
+        assert api.teardown_failed is True
+
+
+# ======================================================================
+# 十三、认证参数落到 query（apikey in query 的场景）
+# ----------------------------------------------------------------------
+# 认证参数与用例参数都往 query 上放，最容易出的问题是「谁覆盖谁」。
+# 约定：用例自己的参数优先，认证参数只补空缺。
+# ======================================================================
+class TestAuthParamsInQuery:
+    def _api(self, session):
+        return make_api(make_profile(
+            env={"base_url": "http://h"},
+            auth={"type": "apikey", "key_name": "api_key", "token": "K", "key_in": "query"},
+            response={"style": "code", "success_values": "0"},
+        ), session)
+
+    def test_merges_auth_into_dict_payload(self, fake_session, capture_attach):
+        api = self._api(fake_session)
+        headers, cookies, payload, extra = api._apply_auth("get", {}, {}, {"q": 1})
+        assert payload == {"q": 1, "api_key": "K"}     # 用例参数保留
+        assert extra is None
+
+    def test_none_payload_carries_auth_only(self, fake_session, capture_attach):
+        api = self._api(fake_session)
+        _, _, payload, extra = api._apply_auth("get", {}, {}, None)
+        assert payload == {"api_key": "K"}
+        assert extra is None
+
+    def test_non_dict_payload_keeps_auth_separate(self, fake_session, capture_attach):
+        """payload 不是字典时无法合并，认证参数改为单独下发 —— 不能把它丢掉。"""
+        api = self._api(fake_session)
+        _, _, payload, extra = api._apply_auth("get", {}, {}, "raw-body")
+        assert payload == "raw-body"                   # 原样保留，不被认证参数冲掉
+        assert extra == {"api_key": "K"}
+
+    def test_no_auth_params_returns_none_extra(self, fake_session, capture_attach):
+        """认证不产生 query 参数时，extra 必须是 None（不是空字典）。"""
+        api = make_api(make_profile(
+            env={"base_url": "http://h"},
+            auth={"type": "apikey", "key_name": "X-Api-Key", "token": "K"},
+            response={"style": "code", "success_values": "0"},
+        ), fake_session)
+        headers, _, payload, extra = api._apply_auth("get", {}, {}, {"q": 1})
+        assert headers["X-Api-Key"] == "K"
+        assert payload == {"q": 1}
+        assert extra is None

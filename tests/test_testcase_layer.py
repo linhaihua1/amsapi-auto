@@ -13,6 +13,7 @@ import importlib
 
 import pytest
 
+from common import profile
 from config import settings
 from tests.conftest import FakeDbMysql
 from utils.readmysql import RdTestcase
@@ -85,6 +86,23 @@ class TestConftestHooks:
         config = FakePytestConfig(allure_report_dir=None)
         case_conftest.pytest_configure(config)
         assert config.option.allure_report_dir is None
+
+    def test_unknown_system_profile_reported_as_usage_error(self):
+        """
+        档案名写错时应给出「清晰一句话 + 可用档案清单」，而不是 INTERNALERROR 堆栈。
+
+        此前校验发生在 pytest_sessionstart 里，ConfigError 会冒成
+        `INTERNALERROR> ... ConfigError`，看起来像框架崩了 —— 而真实原因
+        只是 AMSAPI_SYSTEM 拼错了一个字母。
+        """
+        settings.RunConfig.SYSTEM = "no_such_system"
+        profile.clear_cache()
+        with pytest.raises(pytest.UsageError) as exc:
+            case_conftest.pytest_configure(FakePytestConfig())
+        text = str(exc.value)
+        assert "no_such_system" in text
+        assert "可用档案" in text
+        assert "INTERNALERROR" not in text
 
     def test_sessionstart_writes_environment_when_allure(self, monkeypatch):
         settings.RunConfig.REPORT_TYPE = "allure"

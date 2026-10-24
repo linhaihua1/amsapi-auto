@@ -36,6 +36,18 @@ class TestResolveCredential:
     def test_non_string_untouched(self):
         assert resolve_credential(123) == 123
 
+    def test_missing_variable_keeps_literal(self):
+        """
+        档案里声明的 `${token}` 还没入池时，应当只告警并保留原串。
+
+        原因：占位符是**档案**写的，用例一个字都没提这个变量。
+        若在这里抛「用例引用了未定义变量」，报错会指向错误的层级
+        （实际是「没有先跑登录取票」），排查方向被彻底带偏。
+        文档承诺的「保留原串 + 提示」此前是死代码：base.relace 的严格模式
+        先抛了 CaseDataError，examples/mall 按 README 命令根本跑不通。
+        """
+        assert resolve_credential("${token}") == "${token}"
+
 
 # ======================================================================
 # 二、各认证策略

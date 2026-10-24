@@ -9,7 +9,7 @@ import logging
 import os
 
 from utils import logutil
-from utils.logutil import get_logger, logger
+from utils.logutil import SensitiveFilter, get_logger, logger
 
 
 def _own_handlers():
@@ -74,3 +74,70 @@ class TestLogUtil:
         """日志调用本身不应抛异常（内容含中文与特殊字符）。"""
         logger.info("单元测试日志：中文内容 %s", "ok")
         logger.debug("debug 级别")
+
+
+# ======================================================================
+# 脱敏过滤器（SensitiveFilter）—— 明文泄漏的最后一道防线
+# ----------------------------------------------------------------------
+# 为什么单独测这一层：日志是**落盘产物**，会随 CI 工件被打包、被转发。
+# 口令一旦进了日志文件，事后无法回收。过滤器挂在 logger 上而不是每个调用点，
+# 就是为了「新增日志代码不需要记得脱敏」，因此它的每个分支都必须有效。
+# ======================================================================
+def _record(msg, args=None):
+    return logging.LogRecord("demo", logging.INFO, __file__, 1, msg, args, None)
+
+
+class TestSensitiveFilter:
+    def test_masks_plain_message(self):
+        record = _record("登录口令 password=Secret123")
+        assert SensitiveFilter().filter(record) is True
+        assert "Secret123" not in record.msg
+
+    def test_masks_dict_message(self):
+        """直接打印响应体是常见写法（logger.info(resp_dict)）。"""
+        record = _record({"msg": "认证失败 password=Secret123"})
+        SensitiveFilter().filter(record)
+        assert "Secret123" not in str(record.msg)
+
+    def test_masks_positional_args(self):
+        """
+        参数化日志是性能推荐写法，也最容易成为漏点：
+        口令在 record.args 里，而 record.msg 只是个占位符。
+        """
+        record = _record("响应 %s", ({"msg": "password=Secret123"},))
+        SensitiveFilter().filter(record)
+        assert "Secret123" not in str(record.args)
+
+    def test_masks_mapping_args(self):
+        """%(name)s 映射参数（logging 会把单元素 dict 解包进 record.args）。"""
+        record = logging.LogRecord("demo", logging.INFO, __file__, 1,
+                                   "%(body)s", ({"body": "token=Secret123"},), None)
+        assert isinstance(record.args, dict)          # logging 已解包成映射
+        SensitiveFilter().filter(record)
+        assert "Secret123" not in str(record.args)
+
+    def test_masked_text_is_still_loggable(self):
+        """脱敏后仍必须能正常 format 出字符串（不能因为改了 msg 就崩）。"""
+        record = _record("headers = %s", ({"password": "Secret123"},))
+        SensitiveFilter().filter(record)
+        assert "Secret123" not in record.getMessage()
+
+    def test_disabled_keeps_original(self):
+        """关闭开关是排查问题时的逃生门，必须真的原样输出。"""
+        from config import settings
+        settings.MaskConfig.ENABLED = False
+        try:
+            record = _record("password=Secret123")
+            assert SensitiveFilter().filter(record) is True
+            assert record.msg == "password=Secret123"
+        finally:
+            settings.MaskConfig.ENABLED = True
+
+    def test_mask_failure_never_drops_log(self, monkeypatch):
+        """脱敏自己炸了也只能放行原日志 —— 丢日志比泄漏更难查。"""
+        from common import mask as mask_module
+        monkeypatch.setattr(mask_module, "mask_text",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        record = _record("password=Secret123")
+        assert SensitiveFilter().filter(record) is True
+        assert record.msg == "password=Secret123"
